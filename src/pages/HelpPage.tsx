@@ -1,0 +1,224 @@
+import { Link } from 'react-router';
+import './AboutPage.css';
+
+export function HelpPage() {
+  return (
+    <article className="about-page">
+      <h1 className="about-page__title">Help</h1>
+
+      <h2 className="about-page__heading">Pinning stories</h2>
+      <p>
+        Pin a story to keep it in your reading list. Use it as a
+        to-read list: pin the ones you want to read, then sweep the rest.
+      </p>
+      <ul>
+        <li>
+          Tap the <strong>📌 pin</strong> on the right of any row to
+          pin it. Tap again to unpin.
+        </li>
+        <li>
+          <strong>Swipe a story left</strong> for the same toggle.
+        </li>
+      </ul>
+      <p>
+        Pinned stories live in <Link to="/pinned">Pinned</Link> in the
+        menu. They stay on your device until you unpin them.
+      </p>
+
+      <h2 className="about-page__heading">Favoriting stories</h2>
+      <p>
+        Favorites are for the ones you want to keep for good — a
+        permanent keepsake shelf, separate from your pin-for-later list.
+      </p>
+      <ul>
+        <li>
+          Open a thread and tap the <strong>heart</strong> in the thread
+          header to favorite. Tap again to unfavorite.
+        </li>
+        <li>
+          Favorites never expire and are never swept.
+        </li>
+      </ul>
+      <p>
+        They live in <Link to="/favorites">Favorites</Link> in the menu.
+      </p>
+
+      <h2 className="about-page__heading">Marking stories done</h2>
+      <p>
+        Mark a thread <strong>done</strong> once you&rsquo;ve finished
+        reading it — a completion log for things you&rsquo;re through with,
+        separate from your pin-for-later list.
+      </p>
+      <ul>
+        <li>
+          Open a thread and tap the <strong>check</strong> in the thread
+          action bar. Done stories drop out of every feed, so the ones
+          you&rsquo;ve read stop cluttering the list.
+        </li>
+        <li>
+          Marking done also <strong>unpins</strong> the story and closes
+          the thread — Pin is your active queue, Done is where reads go
+          when they leave it, so a story is never in both at once.
+        </li>
+      </ul>
+      <p>
+        Done stories live in <Link to="/done">Done</Link> in the menu. Tap
+        the check on any row there to unmark it. Favoriting is independent:
+        you can favorite a story whether or not it&rsquo;s done.
+      </p>
+
+      <h2 className="about-page__heading">Hiding stories</h2>
+      <p>
+        Hiding removes a story you don&rsquo;t want to see in your feeds:
+      </p>
+      <ul>
+        <li>
+          <strong>Swipe a story right</strong> in any feed to hide it.
+        </li>
+        <li>
+          Tap the <strong>sweep</strong> icon in the top bar to hide
+          every unpinned story on screen at once.
+        </li>
+      </ul>
+
+      <h2 className="about-page__heading">Reviewing hidden stories</h2>
+      <p>
+        Hidden stories live in <Link to="/hidden">Hidden</Link> in
+        the menu, newest first. Tap <strong>Unhide</strong> on any
+        row to bring it back to your feeds, or{' '}
+        <strong>Forget all hidden</strong> at the top of the list to
+        clear it. Hidden entries expire on their own after seven days.
+      </p>
+
+      <h2 className="about-page__heading">Undoing a hide</h2>
+      <p>
+        Tap the <strong>undo</strong> icon in the top bar to bring back
+        the stories you most recently hid — whether you swiped them
+        away one at a time or swept them all at once.
+      </p>
+
+      <h2 className="about-page__heading">The story actions menu</h2>
+      <p>
+        <strong>Long-press</strong> any story row to open a menu with
+        quick actions: pin or unpin it, hide it, and{' '}
+        <strong>share</strong> it. Share uses your device&rsquo;s native
+        share sheet when available, and falls back to copying the link
+        to the clipboard.
+      </p>
+
+      <h2 className="about-page__heading">Reading comments</h2>
+      <p>
+        Open a thread and every comment starts <strong>collapsed</strong>
+        {' '}— you see the author, age, reply count, and the first three
+        lines of the body.
+      </p>
+      <ul>
+        <li>
+          <strong>Tap a comment</strong> to expand it. The full body
+          appears, and its direct replies show up below as their own
+          three-line previews. Tap any of those to drill in.
+        </li>
+        <li>
+          Tap the comment again to collapse it back.
+        </li>
+        <li>
+          Tapping a link inside a comment opens the link — it
+          doesn&rsquo;t toggle the comment.
+        </li>
+        <li>
+          Expanded comments pick up a thin action toolbar at the
+          bottom with <strong>Upvote</strong>, <strong>Downvote</strong>,
+          and <strong>Reply on HN ↗</strong> buttons. Reply hands you
+          off to Hacker News itself — newshacker doesn&rsquo;t submit
+          comments. Upvote and Downvote are visible placeholders today;
+          comment voting isn&rsquo;t wired up yet.
+        </li>
+      </ul>
+
+      <h2 className="about-page__heading">Article summaries</h2>
+      <p>
+        When a thread points to an external article, a short AI
+        summary appears near the top of the thread page so you can
+        size it up before tapping through. Summaries are generated by
+        Gemini and may be inaccurate — treat them as a
+        preview, not a substitute for the article.
+      </p>
+
+      <h2 className="about-page__heading">Recently opened</h2>
+      <p>
+        Stories you&rsquo;ve tapped into recently show up in{' '}
+        <Link to="/opened">Opened</Link> in the menu, so you can find
+        that thing you read earlier without scrolling the feed again.
+        Entries here expire after seven days.
+      </p>
+
+      <h2 className="about-page__heading">Keyboard shortcuts</h2>
+      <p>
+        On any list page, use the keyboard to navigate without
+        touching the mouse. Press <strong>?</strong> at any time to
+        see the same list as an overlay.
+      </p>
+      <ul>
+        <li>
+          <strong>j</strong> or <strong>↓</strong> — next story.{' '}
+          <strong>k</strong> or <strong>↑</strong> — previous story.
+          The first press focuses the first row.
+        </li>
+        <li>
+          <strong>Enter</strong> — open the highlighted story&rsquo;s
+          comments.
+        </li>
+        <li>
+          <strong>Space</strong> — open the row actions menu (Pin,
+          Hide, Share, …).
+        </li>
+        <li>
+          <strong>o</strong> — open the article URL in a new tab.
+        </li>
+        <li>
+          <strong>p</strong> — pin or unpin the highlighted story.
+        </li>
+        <li>
+          <strong>d</strong> — dismiss (hide) the highlighted story.
+          Focus jumps to the next row.
+        </li>
+        <li>
+          <strong>Esc</strong> — close an open menu or this help.
+        </li>
+      </ul>
+      <p>
+        On a story&rsquo;s comments page the same letter keys carry
+        over: <strong>j</strong>/<strong>k</strong> scroll between
+        visible comments one at a time (expanding a comment makes its
+        replies visible, and j walks those next),{' '}
+        <strong>Enter</strong> expands or collapses the comment at the
+        top of the screen, <strong>o</strong> opens the article,{' '}
+        <strong>p</strong> toggles pin, and <strong>d</strong> marks
+        the story done and closes the thread.
+      </p>
+
+      <h2 className="about-page__heading">Switching theme</h2>
+      <p>
+        Open the menu and pick <strong>Light</strong>,{' '}
+        <strong>Dark</strong>, or <strong>System</strong> under Theme.
+        System follows your device setting and is the default.
+      </p>
+
+      <h2 className="about-page__heading">Pinned, favorite, done, hidden</h2>
+      <p>
+        <strong>Pin</strong> keeps a story in your short-term reading
+        list. <strong>Favorite</strong> keeps it for good.{' '}
+        <strong>Done</strong> marks it finished and clears it from your
+        feeds. <strong>Hide</strong> removes one you don&rsquo;t want to
+        see. Pin and Done are mutually exclusive — marking done unpins —
+        but the rest are independent: you can favorite a story whether or
+        not it&rsquo;s pinned or done, and hiding never touches the other
+        three.
+      </p>
+
+      <p className="about-page__back">
+        <Link to="/top">← Back to Top</Link>
+      </p>
+    </article>
+  );
+}

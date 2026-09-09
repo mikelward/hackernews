@@ -1,0 +1,2226 @@
+import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
+import { render, screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { MemoryRouter, Route, Routes, useLocation } from 'react-router';
+import {
+  IsRestoringProvider,
+  QueryClient,
+  QueryClientProvider,
+} from '@tanstack/react-query';
+import { Thread, TOP_LEVEL_PAGE_SIZE } from './Thread';
+import { FeedBarProvider } from './FeedBarContext';
+import { renderWithProviders } from '../test/renderUtils';
+import { installHNFetchMock, makeStory } from '../test/mockFetch';
+import {
+  installIntersectionObserverMock,
+  uninstallIntersectionObserverMock,
+} from '../test/intersectionObserver';
+import type { HNItem } from '../lib/hn';
+import {
+  _resetThreadOpenStatsForTests,
+  getThreadOpenRecords,
+} from '../lib/threadOpenStats';
+
+function LocationProbe() {
+  const loc = useLocation();
+  return <div data-testid="location-pathname">{loc.pathname}</div>;
+}
+
+// happy-dom's default viewport is 1024px wide, so `(min-width: 960px)`
+// matches out of the box and Thread renders the *wide* action bar
+// (inline Favorite/Share) by default. Tests that exercise the narrow
+// layout — where those actions live in the overflow menu — stub the
+// viewport to narrow. The top-level afterEach restores the original.
+const ORIGINAL_MATCH_MEDIA = window.matchMedia;
+function setViewportWide(wide: boolean) {
+  window.matchMedia = ((query: string) => ({
+    matches: query.includes('min-width: 960px') ? wide : false,
+    media: query,
+    onchange: null,
+    addListener: () => {},
+    removeListener: () => {},
+    addEventListener: () => {},
+    removeEventListener: () => {},
+    dispatchEvent: () => false,
+  })) as unknown as typeof window.matchMedia;
+}
+
+// Wraps the existing HN fetch mock so a specific URL substring is held open
+// until the test releases it. The skeleton tests need a guaranteed loading
+// state — without this, the immediate-resolve mock races React's commit
+// of the loaded state and the skeleton DOM is gone before the assertion runs.
+function gateFetchOn(
+  hnMock: ReturnType<typeof installHNFetchMock>,
+  urlSubstring: string,
+  resolved: Response,
+) {
+  let release!: () => void;
+  const gate = new Promise<void>((r) => {
+    release = r;
+  });
+  const fetchMock = vi.fn(
+    async (input: RequestInfo | URL, _init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes(urlSubstring)) {
+        await gate;
+        return resolved;
+      }
+      return hnMock(input);
+    },
+  );
+  vi.stubGlobal('fetch', fetchMock);
+  return { release };
+}
+
+// Renders <Thread> inside a MemoryRouter with a multi-entry history, so
+// tests can observe what happens when the thread navigates back or home.
+// initialIndex lands on the last entry (the /item/:id route).
+function renderThreadWithHistory({
+  id,
+  entries,
+}: {
+  id: number;
+  entries: string[];
+}) {
+  // MemoryRouter keeps its own history and never touches window.history, but
+  // closeArticleView reads window.history.length to decide back-vs-close-vs-root.
+  // Mirror the intended session-history depth so multi-entry cases exercise the
+  // pop path and single-entry cases exercise the close/root fallback. Cleaned up
+  // in afterEach.
+  Object.defineProperty(window.history, 'length', {
+    configurable: true,
+    value: entries.length,
+  });
+  const client = new QueryClient({
+    defaultOptions: {
+      queries: {
+        retry: false,
+        gcTime: 0,
+        staleTime: 0,
+        networkMode: 'offlineFirst',
+      },
+    },
+  });
+  return render(
+    <QueryClientProvider client={client}>
+      <MemoryRouter initialEntries={entries} initialIndex={entries.length - 1}>
+        <FeedBarProvider>
+          <LocationProbe />
+          <Routes>
+            <Route path="/" element={<div data-testid="route-home" />} />
+            <Route path="/top" element={<div data-testid="route-top" />} />
+            <Route path="/item/:id" element={<Thread id={id} />} />
+          </Routes>
+        </FeedBarProvider>
+      </MemoryRouter>
+    </QueryClientProvider>,
+  );
+}
+
+describe('<Thread>', () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+  });
+  afterEach(() => {
+    window.localStorage.clear();
+    vi.unstubAllGlobals();
+    // Restore window.history.length to its prototype getter (see
+    // renderThreadWithHistory).
+    delete (window.history as unknown as { length?: number }).length;
+    window.matchMedia = ORIGINAL_MATCH_MEDIA;
+  });
+
+  it('renders story header + top-level comments, with replies collapsed by default', async () => {
+    installHNFetchMock({
+      items: {
+        100: makeStory(100, { title: 'Parent', kids: [101], descendants: 3 }),
+        101: {
+          id: 101,
+          type: 'comment',
+          by: 'bob',
+          text: 'hello <b>world</b>',
+          time: Math.floor(Date.now() / 1000) - 60,
+          kids: [102],
+        },
+        102: {
+          id: 102,
+          type: 'comment',
+          by: 'carol',
+          text: 'nested reply',
+          time: Math.floor(Date.now() / 1000) - 30,
+          kids: [103],
+        },
+        103: {
+          id: 103,
+          type: 'comment',
+          by: 'dave',
+          text: 'deep',
+          time: Math.floor(Date.now() / 1000) - 10,
+        },
+      },
+    });
+
+    renderWithProviders(<Thread id={100} />, { route: '/item/100' });
+
+    await waitFor(() => {
+      expect(screen.getByText('Parent')).toBeInTheDocument();
+    });
+    // Only the top bar has "Read article"; the bottom bar's primary slot
+    // is "Back to top" instead.
+    const readArticle = screen.getByRole('link', { name: /read article/i });
+    expect(readArticle).toHaveAttribute('href', 'https://example.com/100');
+    expect(readArticle).toHaveTextContent(/^\s*Read article\s*$/);
+    expect(readArticle).not.toHaveTextContent(/example\.com/);
+    expect(
+      screen.getByRole('button', { name: /back to top/i }),
+    ).toBeInTheDocument();
+    // Top-level comment body visible
+    await waitFor(() => {
+      expect(screen.getByText(/hello/)).toBeInTheDocument();
+    });
+    // Nested replies are collapsed by default
+    expect(screen.queryByText(/nested reply/)).toBeNull();
+    expect(screen.queryByText(/deep/)).toBeNull();
+  });
+
+  it('expands a collapsed subtree via the meta toggle and lazy-loads children', async () => {
+    installHNFetchMock({
+      items: {
+        200: makeStory(200, { kids: [201], descendants: 2 }),
+        201: {
+          id: 201,
+          type: 'comment',
+          by: 'x',
+          text: 'top comment',
+          kids: [202],
+          time: 1,
+        },
+        202: {
+          id: 202,
+          type: 'comment',
+          by: 'y',
+          text: 'child comment',
+          time: 2,
+        },
+      },
+    });
+
+    renderWithProviders(<Thread id={200} />);
+
+    await waitFor(() => {
+      expect(screen.getByText(/top comment/)).toBeInTheDocument();
+    });
+    expect(screen.queryByText(/child comment/)).toBeNull();
+
+    const expander = screen.getByRole('button', { name: /expand comment/i });
+    await userEvent.click(expander);
+
+    await waitFor(() => {
+      expect(screen.getByText(/child comment/)).toBeInTheDocument();
+    });
+
+    const collapser = screen.getByRole('button', { name: /collapse comment/i });
+    await userEvent.click(collapser);
+    expect(screen.queryByText(/child comment/)).toBeNull();
+  });
+
+  it('clamps comment body by default and removes the clamp when expanded', async () => {
+    installHNFetchMock({
+      items: {
+        400: makeStory(400, { kids: [401], descendants: 1 }),
+        401: {
+          id: 401,
+          type: 'comment',
+          by: 'x',
+          text: 'a long enough comment body',
+          time: 1,
+        },
+      },
+    });
+
+    renderWithProviders(<Thread id={400} />);
+
+    await screen.findByText(/a long enough comment body/);
+    // Re-query the body each time rather than holding a reference: the async
+    // summary cards settle after first paint, and React 19 replaces the
+    // dangerouslySetInnerHTML child on that re-render, detaching any node
+    // captured earlier. The .comment__body element itself is stable, so look
+    // it up fresh before each assertion/interaction.
+    const getBody = () =>
+      screen
+        .getByText(/a long enough comment body/)
+        .closest('.comment__body') as HTMLElement;
+
+    expect(getBody()).toHaveClass('comment__body--clamped');
+
+    await userEvent.click(getBody());
+    expect(getBody()).not.toHaveClass('comment__body--clamped');
+
+    await userEvent.click(getBody());
+    expect(getBody()).toHaveClass('comment__body--clamped');
+  });
+
+  it('renders the comment author as an internal link to /user/<by>', async () => {
+    installHNFetchMock({
+      items: {
+        500: makeStory(500, { kids: [501], descendants: 1 }),
+        501: {
+          id: 501,
+          type: 'comment',
+          by: 'alice',
+          text: 'comment body',
+          time: 1,
+        },
+      },
+    });
+
+    renderWithProviders(<Thread id={500} />);
+
+    const author = await screen.findByRole('link', { name: 'alice' });
+    expect(author).toHaveAttribute('href', '/user/alice');
+  });
+
+  it('shows a "Reply on HN" link on expanded comments, hidden when collapsed', async () => {
+    installHNFetchMock({
+      items: {
+        450: makeStory(450, { kids: [451], descendants: 1 }),
+        451: {
+          id: 451,
+          type: 'comment',
+          by: 'x',
+          text: 'comment body',
+          time: 1,
+        },
+      },
+    });
+
+    renderWithProviders(<Thread id={450} />);
+    await screen.findByText(/comment body/);
+
+    expect(screen.queryByRole('link', { name: /reply on hn/i })).toBeNull();
+
+    await userEvent.click(
+      screen.getByRole('button', { name: /expand comment/i }),
+    );
+
+    const reply = screen.getByRole('link', { name: /reply on hn/i });
+    expect(reply).toHaveAttribute(
+      'href',
+      'https://news.ycombinator.com/reply?id=451',
+    );
+    expect(reply).toHaveAttribute('target', '_blank');
+    expect(reply).toHaveAttribute('rel', expect.stringContaining('noopener'));
+  });
+
+  it('filters out deleted, dead, and empty comments from a thread', async () => {
+    installHNFetchMock({
+      items: {
+        900: makeStory(900, { kids: [901, 902, 903, 904], descendants: 4 }),
+        901: {
+          id: 901,
+          type: 'comment',
+          by: 'alice',
+          text: 'visible comment',
+          time: 1,
+        },
+        902: { id: 902, type: 'comment', deleted: true, time: 2 },
+        903: { id: 903, type: 'comment', dead: true, by: 'bob', text: 'x', time: 3 },
+        904: { id: 904, type: 'comment', by: 'carol', time: 4 },
+      },
+    });
+
+    renderWithProviders(<Thread id={900} />);
+
+    await waitFor(() => {
+      expect(screen.getByText(/visible comment/)).toBeInTheDocument();
+    });
+    expect(screen.queryByText('[deleted]')).toBeNull();
+    expect(screen.queryByText('[dead]')).toBeNull();
+    expect(screen.queryByText('carol')).toBeNull();
+  });
+
+  it('shows placeholder for deleted items without crashing', async () => {
+    installHNFetchMock({
+      items: {
+        300: { id: 300, deleted: true },
+      },
+    });
+
+    renderWithProviders(<Thread id={300} />);
+    await waitFor(() => {
+      expect(screen.getByText('[deleted]')).toBeInTheDocument();
+    });
+  });
+
+  it('marks the article as opened when the Read article link is clicked', async () => {
+    installHNFetchMock({
+      items: { 720: makeStory(720, { title: 'Readable' }) },
+    });
+
+    renderWithProviders(<Thread id={720} />);
+    await waitFor(() => {
+      expect(screen.getByText('Readable')).toBeInTheDocument();
+    });
+
+    const link = screen.getByRole('link', { name: /read article/i });
+    // jsdom follows hrefs — cancel navigation so the click handler still runs.
+    link.addEventListener('click', (e) => e.preventDefault());
+    await userEvent.click(link);
+
+    const stored = window.localStorage.getItem('newshacker:openedStoryIds');
+    expect(stored).toBeTruthy();
+    const parsed = JSON.parse(stored as string) as Array<{
+      id: number;
+      articleAt?: number;
+    }>;
+    const entry = parsed.find((e) => e.id === 720);
+    expect(entry?.articleAt).toBeTruthy();
+  });
+
+  it('wraps the article title in a link to the article url (new tab, opener-safe)', async () => {
+    installHNFetchMock({
+      items: {
+        721: makeStory(721, {
+          title: 'Tappable headline',
+          url: 'https://example.com/721',
+        }),
+      },
+    });
+
+    renderWithProviders(<Thread id={721} />);
+    await waitFor(() => {
+      expect(screen.getByText('Tappable headline')).toBeInTheDocument();
+    });
+
+    const titleLink = screen.getByTestId('thread-title-link');
+    expect(titleLink).toHaveAttribute('href', 'https://example.com/721');
+    expect(titleLink).toHaveAttribute('target', '_blank');
+    expect(titleLink.getAttribute('rel') ?? '').toMatch(/noopener/);
+    expect(titleLink).toHaveTextContent('Tappable headline');
+  });
+
+  it('renders the article title as plain text for self-posts (no article url)', async () => {
+    installHNFetchMock({
+      items: {
+        722: makeStory(722, {
+          title: 'Ask HN: what about no url?',
+          url: undefined,
+          text: 'body',
+        }),
+      },
+    });
+
+    renderWithProviders(<Thread id={722} />);
+    await waitFor(() => {
+      expect(
+        screen.getByText('Ask HN: what about no url?'),
+      ).toBeInTheDocument();
+    });
+
+    expect(screen.queryByTestId('thread-title-link')).toBeNull();
+  });
+
+  it('marks the article as opened when the title link is clicked', async () => {
+    installHNFetchMock({
+      items: { 723: makeStory(723, { title: 'Openable headline' }) },
+    });
+
+    renderWithProviders(<Thread id={723} />);
+    await waitFor(() => {
+      expect(screen.getByText('Openable headline')).toBeInTheDocument();
+    });
+
+    const link = screen.getByTestId('thread-title-link');
+    link.addEventListener('click', (e) => e.preventDefault());
+    await userEvent.click(link);
+
+    const stored = window.localStorage.getItem('newshacker:openedStoryIds');
+    expect(stored).toBeTruthy();
+    const parsed = JSON.parse(stored as string) as Array<{
+      id: number;
+      articleAt?: number;
+    }>;
+    const entry = parsed.find((e) => e.id === 723);
+    expect(entry?.articleAt).toBeTruthy();
+  });
+
+  it('does not inline a non-http(s) url into an href (title + Read article both gated)', async () => {
+    installHNFetchMock({
+      items: {
+        724: makeStory(724, {
+          title: 'Sneaky headline',
+          // HN content is untrusted. If a non-web scheme ever gets through,
+          // the title must render as plain text and the Read article button
+          // must not render — otherwise a tap could execute script on our
+          // origin. Guarded by isSafeHttpUrl in Thread.tsx.
+          url: 'javascript:alert(1)',
+        }),
+      },
+    });
+
+    renderWithProviders(<Thread id={724} />);
+    await waitFor(() => {
+      expect(screen.getByText('Sneaky headline')).toBeInTheDocument();
+    });
+
+    expect(screen.queryByTestId('thread-title-link')).toBeNull();
+    expect(
+      screen.queryByRole('link', { name: /read article/i }),
+    ).toBeNull();
+  });
+
+  it('toggles favorite state via the Favorite entry in the overflow menu, independently of Pin', async () => {
+    setViewportWide(false);
+    installHNFetchMock({
+      items: { 710: makeStory(710, { title: 'Lovable' }) },
+    });
+
+    renderWithProviders(<Thread id={710} />);
+    await waitFor(() => {
+      expect(screen.getByText('Lovable')).toBeInTheDocument();
+    });
+
+    // On narrow viewports Favorite lives in the overflow menu — it's a
+    // keepsake action, less frequent than Done on the comments view.
+    expect(screen.queryByTestId('thread-favorite')).toBeNull();
+
+    await userEvent.click(screen.getByTestId('thread-more'));
+    const favItem = screen.getByTestId('story-row-menu-favorite');
+    expect(favItem).toHaveTextContent(/^favorite$/i);
+    await userEvent.click(favItem);
+    expect(
+      window.localStorage.getItem('newshacker:favoriteStoryIds'),
+    ).toContain('"id":710');
+    // Pin is untouched by Favorite
+    expect(window.localStorage.getItem('newshacker:pinnedStoryIds')).toBeNull();
+    await waitFor(() => {
+      expect(screen.queryByTestId('story-row-menu')).toBeNull();
+    });
+
+    await userEvent.click(screen.getByTestId('thread-more'));
+    const unfavItem = screen.getByTestId('story-row-menu-favorite');
+    expect(unfavItem).toHaveTextContent(/^unfavorite$/i);
+    await userEvent.click(unfavItem);
+    const storedFav = window.localStorage.getItem(
+      'newshacker:favoriteStoryIds',
+    );
+    const parsedFav = storedFav
+      ? (JSON.parse(storedFav) as Array<{ id: number; deleted?: true }>)
+      : [];
+    expect(parsedFav.filter((e) => !e.deleted)).toEqual([]);
+  });
+
+  describe('wide-screen action bar (≥960px)', () => {
+    // happy-dom defaults to a 1024px viewport, so `wide` is already true
+    // here; the explicit stub documents intent and guards against a
+    // future default change. The top-level afterEach restores matchMedia.
+    it('surfaces Favorite and Share as inline icon buttons and drops them from the menu', async () => {
+      setViewportWide(true);
+      installHNFetchMock({
+        items: {
+          760: makeStory(760, {
+            title: 'Wide',
+            url: 'https://example.com/760',
+          }),
+        },
+      });
+      renderWithProviders(<Thread id={760} />);
+      await waitFor(() => {
+        expect(screen.getByText('Wide')).toBeInTheDocument();
+      });
+
+      // Inline icons present on both bars.
+      expect(screen.getByTestId('thread-favorite')).toBeInTheDocument();
+      expect(screen.getByTestId('thread-share')).toBeInTheDocument();
+      expect(screen.getByTestId('thread-favorite-bottom')).toBeInTheDocument();
+      expect(screen.getByTestId('thread-share-bottom')).toBeInTheDocument();
+
+      // Open on Hacker News still lives in the overflow menu...
+      await userEvent.click(screen.getByTestId('thread-more'));
+      expect(
+        screen.getByTestId('story-row-menu-open-on-hn'),
+      ).toBeInTheDocument();
+      // ...but Favorite and Share have moved out of it.
+      expect(screen.queryByTestId('story-row-menu-favorite')).toBeNull();
+      expect(screen.queryByTestId('story-row-menu-share')).toBeNull();
+    });
+
+    it('toggles favorite via the inline heart button on wide screens', async () => {
+      setViewportWide(true);
+      installHNFetchMock({
+        items: { 770: makeStory(770, { title: 'Heartable' }) },
+      });
+      renderWithProviders(<Thread id={770} />);
+      await waitFor(() => {
+        expect(screen.getByText('Heartable')).toBeInTheDocument();
+      });
+
+      const fav = screen.getByTestId('thread-favorite');
+      expect(fav).toHaveAttribute('aria-pressed', 'false');
+      await userEvent.click(fav);
+      expect(
+        window.localStorage.getItem('newshacker:favoriteStoryIds'),
+      ).toContain('"id":770');
+      expect(screen.getByTestId('thread-favorite')).toHaveAttribute(
+        'aria-pressed',
+        'true',
+      );
+    });
+
+    it('shares via the inline Share button on wide screens', async () => {
+      setViewportWide(true);
+      const shareSpy = vi.fn().mockResolvedValue(undefined);
+      const hadShare = 'share' in window.navigator;
+      Object.defineProperty(window.navigator, 'share', {
+        value: shareSpy,
+        configurable: true,
+      });
+      try {
+        installHNFetchMock({
+          items: {
+            780: makeStory(780, {
+              title: 'Shareable',
+              url: 'https://example.com/780',
+            }),
+          },
+        });
+        renderWithProviders(<Thread id={780} />);
+        await waitFor(() => {
+          expect(screen.getByText('Shareable')).toBeInTheDocument();
+        });
+
+        await userEvent.click(screen.getByTestId('thread-share'));
+        await waitFor(() => {
+          expect(shareSpy).toHaveBeenCalledTimes(1);
+        });
+        expect(shareSpy.mock.calls[0]?.[0]).toMatchObject({
+          title: 'Shareable',
+          url: 'http://localhost:3000/item/780',
+        });
+      } finally {
+        if (hadShare) {
+          Object.defineProperty(window.navigator, 'share', {
+            value: undefined,
+            configurable: true,
+          });
+        } else {
+          // @ts-expect-error — clean up the stub we added.
+          delete (window.navigator as Navigator & { share?: unknown }).share;
+        }
+      }
+    });
+  });
+
+  it('toggles pinned state via the Pin button on the bar', async () => {
+    installHNFetchMock({
+      items: { 700: makeStory(700, { title: 'Pinnable' }) },
+    });
+
+    renderWithProviders(<Thread id={700} />);
+    await waitFor(() => {
+      expect(screen.getByText('Pinnable')).toBeInTheDocument();
+    });
+
+    const pin = screen.getByTestId('thread-pin');
+    expect(pin).toHaveAccessibleName(/^pin$/i);
+    expect(pin).toHaveAttribute('aria-pressed', 'false');
+
+    await userEvent.click(pin);
+    expect(pin).toHaveAccessibleName(/unpin/i);
+    expect(pin).toHaveAttribute('aria-pressed', 'true');
+    expect(
+      window.localStorage.getItem('newshacker:pinnedStoryIds'),
+    ).toContain('"id":700');
+
+    await userEvent.click(pin);
+    expect(pin).toHaveAttribute('aria-pressed', 'false');
+    expect(pin).toHaveAccessibleName(/^pin$/i);
+    const storedPin = window.localStorage.getItem(
+      'newshacker:pinnedStoryIds',
+    );
+    const parsedPin = storedPin
+      ? (JSON.parse(storedPin) as Array<{ id: number; deleted?: true }>)
+      : [];
+    expect(parsedPin.filter((e) => !e.deleted)).toEqual([]);
+  });
+
+  it('mark-done: records the story, unpins it, and pops back to the previous entry', async () => {
+    installHNFetchMock({
+      items: { 730: makeStory(730, { title: 'Finishable' }) },
+    });
+    // Pre-pin the story so we can verify mark-done unpins it.
+    window.localStorage.setItem(
+      'newshacker:pinnedStoryIds',
+      JSON.stringify([{ id: 730, at: Date.now() }]),
+    );
+
+    renderThreadWithHistory({
+      id: 730,
+      entries: ['/top', '/item/730'],
+    });
+    await screen.findByText('Finishable');
+
+    const done = screen.getByTestId('thread-done');
+    expect(done).toHaveAccessibleName(/^mark done$/i);
+    expect(done).toHaveAttribute('aria-pressed', 'false');
+
+    await userEvent.click(done);
+
+    // Done persisted.
+    expect(
+      window.localStorage.getItem('newshacker:doneStoryIds'),
+    ).toContain('"id":730');
+
+    // Pin is tombstoned (mark-done unpins).
+    const pinRaw = window.localStorage.getItem('newshacker:pinnedStoryIds');
+    const pinEntries = pinRaw
+      ? (JSON.parse(pinRaw) as Array<{ id: number; deleted?: true }>)
+      : [];
+    expect(pinEntries.filter((e) => !e.deleted && e.id === 730)).toEqual([]);
+
+    // Navigated back to /top (the previous entry), and the thread UI is
+    // gone.
+    await waitFor(() => {
+      expect(screen.getByTestId('location-pathname')).toHaveTextContent(
+        '/top',
+      );
+    });
+    expect(screen.queryByText('Finishable')).toBeNull();
+  });
+
+  it('mark-done with no back entry closes the tab, then falls back to the home feed', async () => {
+    installHNFetchMock({
+      items: { 731: makeStory(731, { title: 'Deeplinked' }) },
+    });
+
+    // Single-entry history: location.key === 'default' and no back entry, so
+    // mark-done tries to close the tab (dismissing a new tab / Custom Tab into
+    // the opener) and, since the browser won't close it here, falls back to '/'.
+    const close = vi.spyOn(window, 'close').mockImplementation(() => {});
+    renderThreadWithHistory({
+      id: 731,
+      entries: ['/item/731'],
+    });
+    await screen.findByText('Deeplinked');
+
+    await userEvent.click(screen.getByTestId('thread-done'));
+
+    expect(close).toHaveBeenCalledTimes(1);
+    await waitFor(() => {
+      expect(screen.getByTestId('location-pathname')).toHaveTextContent('/');
+    });
+    expect(screen.getByTestId('route-home')).toBeInTheDocument();
+  });
+
+  it('unmark-done: does not navigate — the user stays on the thread', async () => {
+    installHNFetchMock({
+      items: { 732: makeStory(732, { title: 'Revisited' }) },
+    });
+    // Pre-mark the story done so we land on an "Unmark done" button.
+    window.localStorage.setItem(
+      'newshacker:doneStoryIds',
+      JSON.stringify([{ id: 732, at: Date.now() }]),
+    );
+
+    renderThreadWithHistory({
+      id: 732,
+      entries: ['/top', '/item/732'],
+    });
+    await screen.findByText('Revisited');
+
+    const done = screen.getByTestId('thread-done');
+    expect(done).toHaveAccessibleName(/unmark done/i);
+    expect(done).toHaveAttribute('aria-pressed', 'true');
+
+    await userEvent.click(done);
+
+    // Still on the thread, state flipped back to "Mark done".
+    expect(screen.getByTestId('location-pathname')).toHaveTextContent(
+      '/item/732',
+    );
+    expect(screen.getByText('Revisited')).toBeInTheDocument();
+    expect(done).toHaveAttribute('aria-pressed', 'false');
+    expect(done).toHaveAccessibleName(/^mark done$/i);
+    // Tombstoned in localStorage, not active.
+    const raw = window.localStorage.getItem('newshacker:doneStoryIds');
+    const entries = raw
+      ? (JSON.parse(raw) as Array<{ id: number; deleted?: true }>)
+      : [];
+    expect(entries.filter((e) => !e.deleted && e.id === 732)).toEqual([]);
+  });
+
+  it('renders a duplicated action bar at the bottom of the thread', async () => {
+    installHNFetchMock({
+      items: { 733: makeStory(733, { title: 'Doubled' }) },
+    });
+
+    renderWithProviders(<Thread id={733} />);
+    await screen.findByText('Doubled');
+
+    // Toggle buttons duplicated with distinct test ids.
+    expect(screen.getByTestId('thread-done')).toBeInTheDocument();
+    expect(screen.getByTestId('thread-done-bottom')).toBeInTheDocument();
+    expect(screen.getByTestId('thread-pin')).toBeInTheDocument();
+    expect(screen.getByTestId('thread-pin-bottom')).toBeInTheDocument();
+    expect(screen.getByTestId('thread-more')).toBeInTheDocument();
+    expect(screen.getByTestId('thread-more-bottom')).toBeInTheDocument();
+    // Primary slot differs: top = Read article link, bottom = Back to top
+    // button. Read article is NOT duplicated on the bottom bar.
+    expect(
+      screen.getAllByRole('link', { name: /read article/i }),
+    ).toHaveLength(1);
+    expect(screen.getByTestId('thread-back-to-top-bottom')).toBeInTheDocument();
+  });
+
+  it('bottom bar Back to top stretches like the top bar primary slot so icon buttons align', async () => {
+    // Regression: the bottom Back to top previously didn't grow, so
+    // Pin/Done/⋮ clustered to the left instead of sitting under their
+    // top-bar counterparts. --stretch gives it the same flex-grow as
+    // --primary (without the orange), keeping icon positions aligned
+    // top-to-bottom.
+    installHNFetchMock({
+      items: { 7351: makeStory(7351, { title: 'StretchTest' }) },
+    });
+
+    renderWithProviders(<Thread id={7351} />);
+    await screen.findByText('StretchTest');
+
+    const bottomBackToTop = screen.getByTestId('thread-back-to-top-bottom');
+    expect(bottomBackToTop.className).toContain('thread__action--stretch');
+    // Not --primary (reserved for the top bar's Read article).
+    expect(bottomBackToTop.className).not.toContain('thread__action--primary');
+  });
+
+  it('bottom bar Back to top scrolls the window to the top', async () => {
+    installHNFetchMock({
+      items: { 735: makeStory(735, { title: 'ScrollyTop' }) },
+    });
+
+    const scrollToSpy = vi.fn();
+    vi.stubGlobal('scrollTo', scrollToSpy);
+
+    renderWithProviders(<Thread id={735} />);
+    await screen.findByText('ScrollyTop');
+
+    const backToTop = screen.getByTestId('thread-back-to-top-bottom');
+    expect(backToTop).toHaveAccessibleName(/back to top/i);
+    await userEvent.click(backToTop);
+
+    expect(scrollToSpy).toHaveBeenCalledWith({ top: 0, behavior: 'smooth' });
+  });
+
+  it('Read article: drops the primary-orange color once the article has been opened', async () => {
+    installHNFetchMock({
+      items: { 737: makeStory(737, { title: 'ReadOnce' }) },
+    });
+
+    // Pre-seed opened-state for story 737 as "article opened once".
+    // Entries require both `id` and `at` (the TTL anchor); `articleAt`
+    // is what flags the article half as opened.
+    const now = Date.now();
+    window.localStorage.setItem(
+      'newshacker:openedStoryIds',
+      JSON.stringify([{ id: 737, at: now, articleAt: now }]),
+    );
+
+    renderWithProviders(<Thread id={737} />);
+    await screen.findByText('ReadOnce');
+
+    const readArticle = screen.getByTestId('thread-read-article');
+    // --primary layout class is preserved, --read overrides the colors.
+    expect(readArticle.className).toContain('thread__action--primary');
+    expect(readArticle.className).toContain('thread__action--read');
+  });
+
+  it('Read article: keeps the primary-orange color before the article is opened', async () => {
+    installHNFetchMock({
+      items: { 738: makeStory(738, { title: 'Unread' }) },
+    });
+
+    renderWithProviders(<Thread id={738} />);
+    await screen.findByText('Unread');
+
+    const readArticle = screen.getByTestId('thread-read-article');
+    expect(readArticle.className).toContain('thread__action--primary');
+    expect(readArticle.className).not.toContain('thread__action--read');
+  });
+
+  it('bottom bar shows Back to top even on self-posts with no article url', async () => {
+    installHNFetchMock({
+      items: {
+        736: makeStory(736, {
+          title: 'Ask HN: no url',
+          url: undefined,
+          text: 'a self post',
+        }),
+      },
+    });
+
+    renderWithProviders(<Thread id={736} />);
+    await screen.findByText('Ask HN: no url');
+
+    // Self-post → no Read article on either bar.
+    expect(
+      screen.queryByRole('link', { name: /read article/i }),
+    ).toBeNull();
+    // But the bottom bar still offers Back to top.
+    expect(screen.getByTestId('thread-back-to-top-bottom')).toBeInTheDocument();
+  });
+
+  it('mark-done from the bottom action bar also navigates back', async () => {
+    installHNFetchMock({
+      items: { 734: makeStory(734, { title: 'BottomDone' }) },
+    });
+
+    renderThreadWithHistory({
+      id: 734,
+      entries: ['/top', '/item/734'],
+    });
+    await screen.findByText('BottomDone');
+
+    await userEvent.click(screen.getByTestId('thread-done-bottom'));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('location-pathname')).toHaveTextContent(
+        '/top',
+      );
+    });
+    expect(
+      window.localStorage.getItem('newshacker:doneStoryIds'),
+    ).toContain('"id":734');
+  });
+
+  // Thread-page voting. The upvote arrow lives in the action row
+  // next to Pin/Favorite and only renders when the user is signed in.
+  // /api/me drives isAuthenticated; /api/vote handles the actual cast.
+  function installVoteFetchMock(
+    username: string | null,
+    voteResponse: () => Response = () => new Response(null, { status: 204 }),
+  ): ReturnType<typeof vi.fn> {
+    const hnMock = installHNFetchMock({
+      items: { 800: makeStory(800, { title: 'Votable' }) },
+    });
+    const outer = vi.fn(
+      async (input: RequestInfo | URL, _init?: RequestInit) => {
+        const url = String(input);
+        if (url === '/api/me') {
+          if (username) {
+            return new Response(JSON.stringify({ username }), {
+              status: 200,
+              headers: { 'content-type': 'application/json' },
+            });
+          }
+          return new Response(JSON.stringify({ error: 'nope' }), {
+            status: 401,
+          });
+        }
+        if (url === '/api/vote') {
+          return voteResponse();
+        }
+        // installHNFetchMock's mock only reads the URL; init is unused
+        // downstream, so we don't thread it through.
+        return hnMock(input);
+      },
+    );
+    vi.stubGlobal('fetch', outer);
+    return outer;
+  }
+
+  it('renders the thread upvote button when logged out and opens the login dialog on tap', async () => {
+    const fetchMock = installVoteFetchMock(null);
+    renderWithProviders(<Thread id={800} />);
+    await waitFor(() => {
+      expect(screen.getByText('Votable')).toBeInTheDocument();
+    });
+    const vote = await screen.findByTestId('thread-vote');
+    expect(vote).toHaveAttribute('aria-pressed', 'false');
+
+    await userEvent.click(vote);
+
+    const dialog = await screen.findByTestId('login-dialog');
+    expect(dialog).toHaveTextContent('Sign in to upvote');
+
+    // The optimistic flip should NOT have fired, and no /api/vote
+    // request should have gone out.
+    expect(vote).toHaveAttribute('aria-pressed', 'false');
+    const voteCalls = fetchMock.mock.calls.filter(
+      ([url]) => String(url) === '/api/vote',
+    );
+    expect(voteCalls).toHaveLength(0);
+  });
+
+  it('renders the thread upvote button and toggles the voted state when signed in', async () => {
+    const fetchMock = installVoteFetchMock('alice');
+    renderWithProviders(<Thread id={800} />);
+    await waitFor(() => {
+      expect(screen.getByTestId('thread-vote')).toBeInTheDocument();
+    });
+
+    const vote = screen.getByTestId('thread-vote');
+    expect(vote).toHaveAccessibleName(/^upvote$/i);
+    expect(vote).toHaveAttribute('aria-pressed', 'false');
+    expect(vote.className).not.toContain('thread__action--active');
+
+    await userEvent.click(vote);
+    expect(vote).toHaveAccessibleName(/^unvote$/i);
+    expect(vote).toHaveAttribute('aria-pressed', 'true');
+    expect(vote.className).toContain('thread__action--active');
+
+    // The optimistic write sat in localStorage under alice's namespace.
+    expect(
+      window.localStorage.getItem('newshacker:votedStoryIds:alice'),
+    ).toContain('800');
+
+    // POST /api/vote was fired with id + how=up.
+    await waitFor(() => {
+      const voteCalls = fetchMock.mock.calls.filter(
+        ([url]) => String(url) === '/api/vote',
+      );
+      expect(voteCalls.length).toBeGreaterThan(0);
+    });
+    const call = fetchMock.mock.calls.find(
+      ([url]) => String(url) === '/api/vote',
+    );
+    expect(JSON.parse(String((call![1] as RequestInit).body))).toEqual({
+      id: 800,
+      how: 'up',
+    });
+
+    // A second tap toggles back to unvoted (how=un on the POST).
+    await userEvent.click(vote);
+    expect(vote).toHaveAttribute('aria-pressed', 'false');
+    await waitFor(() => {
+      const unvoteCalls = fetchMock.mock.calls.filter(([url, init]) => {
+        if (String(url) !== '/api/vote') return false;
+        const body = JSON.parse(String((init as RequestInit).body));
+        return body.how === 'un';
+      });
+      expect(unvoteCalls.length).toBeGreaterThan(0);
+    });
+  });
+
+  it('rolls back the optimistic vote and signs the user out on a 401 from /api/vote', async () => {
+    installVoteFetchMock(
+      'alice',
+      () =>
+        new Response(
+          JSON.stringify({ error: 'Hacker News session expired' }),
+          { status: 401, headers: { 'content-type': 'application/json' } },
+        ),
+    );
+    renderWithProviders(<Thread id={800} />);
+    await waitFor(() => {
+      expect(screen.getByTestId('thread-vote')).toBeInTheDocument();
+    });
+
+    const vote = screen.getByTestId('thread-vote');
+    await userEvent.click(vote);
+
+    // useVote eagerly clears the auth state on a 401 (otherwise
+    // the user keeps seeing logged-in UI for up to 1h). The button
+    // still renders (the upvote affordance is now always visible —
+    // tapping it while logged out prompts to sign in), but the
+    // optimistic vote rolls back to neutral and nothing is
+    // persisted under alice's namespace.
+    await waitFor(() => {
+      expect(vote).toHaveAttribute('aria-pressed', 'false');
+    });
+    expect(
+      window.localStorage.getItem('newshacker:votedStoryIds:alice'),
+    ).toBeNull();
+  });
+
+  it('opens an overflow menu with "Favorite", "Share" and "Open on Hacker News" entries (narrow)', async () => {
+    setViewportWide(false);
+    installHNFetchMock({
+      items: { 730: makeStory(730, { title: 'Mystery' }) },
+    });
+
+    const openSpy = vi.fn();
+    vi.stubGlobal('open', openSpy);
+    const shareSpy = vi.fn().mockResolvedValue(undefined);
+    const hadShare = 'share' in window.navigator;
+    Object.defineProperty(window.navigator, 'share', {
+      value: shareSpy,
+      configurable: true,
+    });
+
+    try {
+      renderWithProviders(<Thread id={730} />);
+      await waitFor(() => {
+        expect(screen.getByText('Mystery')).toBeInTheDocument();
+      });
+
+      expect(screen.queryByTestId('story-row-menu')).toBeNull();
+      // Below 960px the inline Favorite/Share icons are not rendered;
+      // those actions live in the overflow menu instead.
+      expect(screen.queryByTestId('thread-favorite')).toBeNull();
+      expect(screen.queryByTestId('thread-share')).toBeNull();
+
+      const more = screen.getByTestId('thread-more');
+      expect(more).toHaveAttribute('aria-haspopup', 'menu');
+      expect(more).toHaveAttribute('aria-expanded', 'false');
+
+      await userEvent.click(more);
+      expect(more).toHaveAttribute('aria-expanded', 'true');
+      expect(screen.getByTestId('story-row-menu')).toBeInTheDocument();
+      expect(
+        screen.getByTestId('story-row-menu-favorite'),
+      ).toBeInTheDocument();
+
+      await userEvent.click(screen.getByTestId('story-row-menu-open-on-hn'));
+      expect(openSpy).toHaveBeenCalledWith(
+        'https://news.ycombinator.com/item?id=730',
+        '_blank',
+        'noopener,noreferrer',
+      );
+      // Selecting an item closes the sheet.
+      await waitFor(() => {
+        expect(screen.queryByTestId('story-row-menu')).toBeNull();
+      });
+
+      await userEvent.click(more);
+      await userEvent.click(screen.getByTestId('story-row-menu-share'));
+      await waitFor(() => {
+        expect(shareSpy).toHaveBeenCalledTimes(1);
+      });
+      expect(shareSpy.mock.calls[0]?.[0]).toMatchObject({
+        title: 'Mystery',
+        url: 'http://localhost:3000/item/730',
+      });
+    } finally {
+      if (hadShare) {
+        Object.defineProperty(window.navigator, 'share', {
+          value: undefined,
+          configurable: true,
+        });
+      } else {
+        // @ts-expect-error — clean up the stub we added.
+        delete (window.navigator as Navigator & { share?: unknown }).share;
+      }
+    }
+  });
+
+  it('keeps a working "Share" entry on self-posts (shares the thread URL)', async () => {
+    setViewportWide(false);
+    installHNFetchMock({
+      items: {
+        740: makeStory(740, { title: 'Ask HN: anything?', url: undefined }),
+      },
+    });
+
+    renderWithProviders(<Thread id={740} />);
+    await waitFor(() => {
+      expect(screen.getByText('Ask HN: anything?')).toBeInTheDocument();
+    });
+
+    await userEvent.click(screen.getByTestId('thread-more'));
+    expect(screen.getByTestId('story-row-menu-open-on-hn')).toBeInTheDocument();
+    // Share is always available now — self-posts share the /item URL.
+    expect(screen.getByTestId('story-row-menu-share')).toBeInTheDocument();
+  });
+
+  it('shows no read-later entry by default (setting is None)', async () => {
+    setViewportWide(false);
+    installHNFetchMock({
+      items: {
+        749: makeStory(749, {
+          title: 'Default off',
+          url: 'https://example.com/article-749',
+        }),
+      },
+    });
+
+    renderWithProviders(<Thread id={749} />);
+    await waitFor(() => {
+      expect(screen.getByText('Default off')).toBeInTheDocument();
+    });
+
+    await userEvent.click(screen.getByTestId('thread-more'));
+    // No service selected → no "Save to …" entry at all.
+    expect(screen.queryByTestId('story-row-menu-save-instapaper')).toBeNull();
+    expect(screen.queryByTestId('story-row-menu-save-readwise')).toBeNull();
+    expect(screen.queryByTestId('story-row-menu-save-raindrop')).toBeNull();
+  });
+
+  it('offers the selected read-later service, opening its save URL for the article', async () => {
+    setViewportWide(false);
+    // Reader picked Instapaper in Settings.
+    window.localStorage.setItem('newshacker:readLaterService', 'instapaper');
+    installHNFetchMock({
+      items: {
+        750: makeStory(750, {
+          title: 'Readable & Co',
+          url: 'https://example.com/article-750',
+        }),
+      },
+    });
+
+    const openSpy = vi.fn();
+    vi.stubGlobal('open', openSpy);
+
+    renderWithProviders(<Thread id={750} />);
+    await waitFor(() => {
+      expect(screen.getByText('Readable & Co')).toBeInTheDocument();
+    });
+
+    await userEvent.click(screen.getByTestId('thread-more'));
+    // Only the chosen service appears; Readwise/Raindrop do not.
+    expect(screen.queryByTestId('story-row-menu-save-readwise')).toBeNull();
+    // Instapaper deep link carries the encoded article URL + title (not our
+    // /item discussion URL).
+    await userEvent.click(screen.getByTestId('story-row-menu-save-instapaper'));
+    expect(openSpy).toHaveBeenLastCalledWith(
+      'https://www.instapaper.com/hello2' +
+        '?url=https%3A%2F%2Fexample.com%2Farticle-750' +
+        '&title=Readable%20%26%20Co',
+      '_blank',
+      'noopener,noreferrer',
+    );
+  });
+
+  it('omits the read-later entry on self-posts (no article to save)', async () => {
+    setViewportWide(false);
+    window.localStorage.setItem('newshacker:readLaterService', 'readwise');
+    installHNFetchMock({
+      items: {
+        751: makeStory(751, { title: 'Ask HN: thoughts?', url: undefined }),
+      },
+    });
+
+    renderWithProviders(<Thread id={751} />);
+    await waitFor(() => {
+      expect(screen.getByText('Ask HN: thoughts?')).toBeInTheDocument();
+    });
+
+    await userEvent.click(screen.getByTestId('thread-more'));
+    expect(screen.queryByTestId('story-row-menu-save-readwise')).toBeNull();
+  });
+
+  it('shows the read-later entry in the overflow menu on wide viewports too', async () => {
+    setViewportWide(true);
+    window.localStorage.setItem('newshacker:readLaterService', 'readwise');
+    installHNFetchMock({
+      items: {
+        752: makeStory(752, {
+          title: 'Wide readable',
+          url: 'https://example.com/article-752',
+        }),
+      },
+    });
+
+    renderWithProviders(<Thread id={752} />);
+    await waitFor(() => {
+      expect(screen.getByText('Wide readable')).toBeInTheDocument();
+    });
+
+    await userEvent.click(screen.getByTestId('thread-more'));
+    // Favorite/Share are inline icons on wide, but the read-later entry
+    // always lives in the overflow.
+    expect(
+      screen.getByTestId('story-row-menu-save-readwise'),
+    ).toBeInTheDocument();
+  });
+
+  it('auto-fetches and displays the summary card on mount', async () => {
+    installHNFetchMock({
+      items: {
+        800: makeStory(800, { title: 'Linky', url: 'https://example.com/800' }),
+      },
+      summaries: {
+        800: {
+          summary: 'A concise one-sentence summary.',
+        },
+      },
+    });
+
+    renderWithProviders(<Thread id={800} />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId('thread-summary-card')).toBeInTheDocument();
+    });
+    expect(
+      await screen.findByText('A concise one-sentence summary.'),
+    ).toBeInTheDocument();
+    expect(screen.queryByTestId('thread-summarize')).toBeNull();
+  });
+
+  it('shows skeleton lines while the summary is loading and marks the card busy', async () => {
+    const hnMock = installHNFetchMock({
+      items: {
+        820: makeStory(820, { title: 'Slow', url: 'https://example.com/820' }),
+      },
+    });
+    const { release } = gateFetchOn(
+      hnMock,
+      '/api/summary',
+      new Response(JSON.stringify({ summary: 'Eventually here.' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
+
+    renderWithProviders(<Thread id={820} />);
+
+    await screen.findByTestId('thread-summary-skeleton');
+    expect(screen.getByTestId('thread-summary-card')).toHaveAttribute(
+      'aria-busy',
+      'true',
+    );
+
+    release();
+
+    expect(
+      await screen.findByText('Eventually here.'),
+    ).toBeInTheDocument();
+    expect(screen.queryByTestId('thread-summary-skeleton')).toBeNull();
+    expect(screen.getByTestId('thread-summary-card')).toHaveAttribute(
+      'aria-busy',
+      'false',
+    );
+  });
+
+  it('shows an error + Retry in the summary card when the api fails', async () => {
+    installHNFetchMock({
+      items: {
+        810: makeStory(810, { title: 'Flaky', url: 'https://example.com/810' }),
+      },
+      summaries: {
+        810: { error: 'Summarization failed', status: 502 },
+      },
+    });
+
+    renderWithProviders(<Thread id={810} />);
+
+    await waitFor(() => {
+      expect(screen.getByText(/could not summarize/i)).toBeInTheDocument();
+    });
+    expect(
+      screen.getByRole('button', { name: /retry/i }),
+    ).toBeInTheDocument();
+  });
+
+  it('shows a timeout-specific message when the source site did not respond', async () => {
+    installHNFetchMock({
+      items: {
+        811: makeStory(811, { title: 'Hugged', url: 'https://example.com/811' }),
+      },
+      summaries: {
+        811: {
+          error: "The article site didn't respond in time",
+          reason: 'source_timeout',
+          status: 504,
+        },
+      },
+    });
+
+    renderWithProviders(<Thread id={811} />);
+
+    await waitFor(() => {
+      expect(
+        screen.getByText(/didn't respond in time/i),
+      ).toBeInTheDocument();
+    });
+    expect(
+      screen.getByText(/try opening the link directly/i),
+    ).toBeInTheDocument();
+  });
+
+  it('shows a temporarily-unavailable message when Jina quota is exhausted', async () => {
+    // 503 summary_budget_exhausted is the user-facing surface of the
+    // Jina 402 handling. Render friendly "try again later" copy rather
+    // than the permanent "aren't available" or misleading
+    // "article is unreachable" messages.
+    installHNFetchMock({
+      items: {
+        813: makeStory(813, { title: 'Paywalled Quota', url: 'https://example.com/813' }),
+      },
+      summaries: {
+        813: {
+          error: 'Summaries are temporarily unavailable',
+          reason: 'summary_budget_exhausted',
+          status: 503,
+        },
+      },
+    });
+
+    renderWithProviders(<Thread id={813} />);
+
+    await waitFor(() => {
+      expect(
+        screen.getByText(/temporarily unavailable/i),
+      ).toBeInTheDocument();
+    });
+  });
+
+  it('shows a rate-limited message when the summary endpoint 429s', async () => {
+    // Regression guard for the per-IP cache-miss rate limit on
+    // /api/summary. A 429 with `reason: 'rate_limited'` must render
+    // the "Too many requests — try again later." copy, not the
+    // generic "Summarization failed" fallback.
+    installHNFetchMock({
+      items: {
+        820: makeStory(820, {
+          title: 'Rate limited',
+          url: 'https://example.com/820',
+        }),
+      },
+      summaries: {
+        820: {
+          error: 'Too many requests',
+          reason: 'rate_limited',
+          status: 429,
+        },
+      },
+    });
+
+    renderWithProviders(<Thread id={820} />);
+
+    await waitFor(() => {
+      expect(
+        screen.getByText(/too many requests — try again later/i),
+      ).toBeInTheDocument();
+    });
+  });
+
+  it('shows an unreachable-specific message when the source site blocks us', async () => {
+    installHNFetchMock({
+      items: {
+        812: makeStory(812, { title: 'Blocked', url: 'https://example.com/812' }),
+      },
+      summaries: {
+        812: {
+          error: 'Could not access the article',
+          reason: 'source_unreachable',
+          status: 502,
+        },
+      },
+    });
+
+    renderWithProviders(<Thread id={812} />);
+
+    await waitFor(() => {
+      expect(
+        screen.getByText(/couldn't reach the article site/i),
+      ).toBeInTheDocument();
+    });
+  });
+
+  it('renders a summary card for self-posts with a text body', async () => {
+    // Self-posts are summarized directly from `story.text` — no Jina
+    // round-trip — so the card should appear on the thread just like it
+    // does for link posts.
+    installHNFetchMock({
+      items: {
+        850: makeStory(850, {
+          title: 'Ask HN: no url',
+          url: undefined,
+          text: 'a self post',
+        }),
+      },
+      summaries: { 850: { summary: 'Self-post summary.' } },
+    });
+
+    renderWithProviders(<Thread id={850} />);
+    await waitFor(() => {
+      expect(screen.getByText('Ask HN: no url')).toBeInTheDocument();
+    });
+
+    const card = await screen.findByTestId('thread-summary-card');
+    expect(card).toBeInTheDocument();
+    expect(card).toHaveTextContent('Self-post summary.');
+  });
+
+  it('does not render a summary card when the story has neither url nor text', async () => {
+    installHNFetchMock({
+      items: {
+        851: makeStory(851, {
+          title: 'Empty story',
+          url: undefined,
+          text: undefined,
+        }),
+      },
+    });
+
+    renderWithProviders(<Thread id={851} />);
+    await waitFor(() => {
+      expect(screen.getByText('Empty story')).toBeInTheDocument();
+    });
+
+    expect(screen.queryByTestId('thread-summary-card')).toBeNull();
+  });
+
+  it('does not render a summary card when a self-post body is effectively empty', async () => {
+    // Regression: `<p> </p>` is truthy but the server returns 400
+    // `no_article` after HTML strip + trim. Rendering the card anyway
+    // would surface a retryable "Could not summarize" error for a
+    // post that was never summarizable.
+    installHNFetchMock({
+      items: {
+        852: makeStory(852, {
+          title: 'Whitespace body',
+          url: undefined,
+          text: '<p>   </p>',
+        }),
+      },
+    });
+
+    renderWithProviders(<Thread id={852} />);
+    await waitFor(() => {
+      expect(screen.getByText('Whitespace body')).toBeInTheDocument();
+    });
+
+    expect(screen.queryByTestId('thread-summary-card')).toBeNull();
+  });
+
+  it('shows domain (not author) in the meta line for link posts', async () => {
+    installHNFetchMock({
+      items: {
+        600: makeStory(600, {
+          title: 'A link post',
+          url: 'https://example.com/600',
+          by: 'alice',
+          score: 42,
+          descendants: 7,
+        }),
+      },
+    });
+
+    renderWithProviders(<Thread id={600} />);
+
+    const meta = await screen.findByTestId('thread-meta');
+    expect(meta).toHaveTextContent(
+      /example\.com · \S+ · 42 points · 7 comments/,
+    );
+    // Author link is not in the meta for link posts.
+    expect(meta.querySelector('.thread__author')).toBeNull();
+
+    const domainLink = meta.querySelector('.thread__domain');
+    expect(domainLink).not.toBeNull();
+    expect(domainLink).toHaveTextContent('example.com');
+    expect(domainLink).toHaveAttribute('href', 'https://example.com/');
+    expect(domainLink).toHaveAttribute('target', '_blank');
+    expect(domainLink).toHaveAttribute(
+      'rel',
+      expect.stringContaining('noopener'),
+    );
+  });
+
+  it('shows author link (not domain) in the meta line for self posts', async () => {
+    installHNFetchMock({
+      items: {
+        610: makeStory(610, {
+          title: 'Ask HN',
+          url: undefined,
+          by: 'bob',
+          score: 5,
+          descendants: 0,
+          text: 'a self post',
+        }),
+      },
+    });
+
+    renderWithProviders(<Thread id={610} />);
+
+    const meta = await screen.findByTestId('thread-meta');
+    const author = meta.querySelector('.thread__author');
+    expect(author).not.toBeNull();
+    expect(author).toHaveTextContent('bob');
+    expect(meta).toHaveTextContent(/bob · \S+ · 5 points · 0 comments/);
+  });
+
+  it('auto-fetches and renders the comments summary card when the story has kids', async () => {
+    installHNFetchMock({
+      items: {
+        950: makeStory(950, {
+          title: 'Lots of discussion',
+          kids: [951],
+          descendants: 1,
+        }),
+        951: {
+          id: 951,
+          type: 'comment',
+          by: 'alice',
+          text: 'great article',
+          time: 1,
+        },
+      },
+      commentsSummaries: {
+        950: { insights: ['Alpha insight.', 'Beta insight.'] },
+      },
+    });
+
+    renderWithProviders(<Thread id={950} />);
+
+    const card = await screen.findByTestId('thread-comments-summary-card');
+    expect(card).toBeInTheDocument();
+    expect(await screen.findByText('Alpha insight.')).toBeInTheDocument();
+    expect(screen.getByText('Beta insight.')).toBeInTheDocument();
+  });
+
+  it('renders both the article and comments summary cards for self-posts (Ask HN) with kids', async () => {
+    // Self-posts with body text get the article summary card too — it's
+    // generated directly from `story.text` instead of a fetched article.
+    installHNFetchMock({
+      items: {
+        960: makeStory(960, {
+          title: 'Ask HN: thoughts?',
+          url: undefined,
+          text: 'what do you think',
+          kids: [961],
+          descendants: 1,
+        }),
+        961: {
+          id: 961,
+          type: 'comment',
+          by: 'bob',
+          text: 'here is a thought',
+          time: 1,
+        },
+      },
+      summaries: { 960: { summary: 'Seeking opinions.' } },
+      commentsSummaries: {
+        960: { insights: ['Community thinks carefully.'] },
+      },
+    });
+
+    renderWithProviders(<Thread id={960} />);
+
+    await screen.findByText('Ask HN: thoughts?');
+    expect(
+      await screen.findByTestId('thread-summary-card'),
+    ).toBeInTheDocument();
+    expect(await screen.findByText('Seeking opinions.')).toBeInTheDocument();
+
+    expect(
+      await screen.findByTestId('thread-comments-summary-card'),
+    ).toBeInTheDocument();
+    expect(
+      await screen.findByText('Community thinks carefully.'),
+    ).toBeInTheDocument();
+  });
+
+  it('does not render the comments summary card for stories without kids', async () => {
+    installHNFetchMock({
+      items: {
+        970: makeStory(970, {
+          title: 'Lonely',
+          kids: [],
+          descendants: 0,
+        }),
+      },
+    });
+
+    renderWithProviders(<Thread id={970} />);
+
+    await screen.findByText('Lonely');
+    expect(screen.queryByTestId('thread-comments-summary-card')).toBeNull();
+  });
+
+  it('shows a skeleton while the comments summary loads and marks the card busy', async () => {
+    const hnMock = installHNFetchMock({
+      items: {
+        980: makeStory(980, { kids: [981], descendants: 1 }),
+        981: {
+          id: 981,
+          type: 'comment',
+          by: 'x',
+          text: 'body',
+          time: 1,
+        },
+      },
+    });
+    const { release } = gateFetchOn(
+      hnMock,
+      '/api/comments-summary',
+      new Response(JSON.stringify({ insights: ['Eventually here.'] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    );
+
+    renderWithProviders(<Thread id={980} />);
+
+    await screen.findByTestId('thread-comments-summary-skeleton');
+    expect(
+      screen.getByTestId('thread-comments-summary-card'),
+    ).toHaveAttribute('aria-busy', 'true');
+
+    release();
+
+    expect(await screen.findByText('Eventually here.')).toBeInTheDocument();
+    expect(
+      screen.queryByTestId('thread-comments-summary-skeleton'),
+    ).toBeNull();
+    expect(
+      screen.getByTestId('thread-comments-summary-card'),
+    ).toHaveAttribute('aria-busy', 'false');
+  });
+
+  it('shows an error with Retry when the comments summary api fails', async () => {
+    installHNFetchMock({
+      items: {
+        // Self-post (no url) so we don't get a second Retry button from
+        // the article summary card, which would make the role query
+        // ambiguous. The self-post gets a successful /api/summary fixture
+        // so its card resolves into a normal summary state (no Retry),
+        // leaving only the comments-summary card's Retry visible.
+        990: makeStory(990, {
+          kids: [991],
+          descendants: 1,
+          url: undefined,
+          text: 'self',
+        }),
+        991: { id: 991, type: 'comment', by: 'x', text: 'hi', time: 1 },
+      },
+      summaries: { 990: { summary: 'self-post summary.' } },
+      commentsSummaries: {
+        990: { error: 'Summarization failed', status: 502 },
+      },
+    });
+
+    renderWithProviders(<Thread id={990} />);
+
+    await waitFor(() => {
+      expect(
+        screen.getByText(/could not summarize comments/i),
+      ).toBeInTheDocument();
+    });
+    const card = screen.getByTestId('thread-comments-summary-card');
+    expect(
+      screen.getByRole('button', { name: /retry/i }),
+    ).toBeInTheDocument();
+    expect(card).toBeInTheDocument();
+  });
+
+  it('paginates top-level comments (only renders first page)', async () => {
+    const totalKids = TOP_LEVEL_PAGE_SIZE + 5;
+    const kidIds = Array.from({ length: totalKids }, (_, i) => 1000 + i);
+    const items: Record<number, HNItem | null> = {
+      500: makeStory(500, { kids: kidIds, descendants: totalKids }),
+    };
+    for (const kid of kidIds) {
+      items[kid] = {
+        id: kid,
+        type: 'comment',
+        by: `u${kid}`,
+        text: `comment ${kid}`,
+        time: 1,
+      };
+    }
+    installHNFetchMock({ items });
+
+    renderWithProviders(<Thread id={500} />);
+
+    await waitFor(() => {
+      expect(screen.getByText(/comment 1000/)).toBeInTheDocument();
+    });
+    // Last item on first page visible
+    expect(
+      screen.getByText(`comment ${1000 + TOP_LEVEL_PAGE_SIZE - 1}`),
+    ).toBeInTheDocument();
+    // Items beyond the first page are NOT rendered yet
+    expect(
+      screen.queryByText(`comment ${1000 + TOP_LEVEL_PAGE_SIZE}`),
+    ).toBeNull();
+    // Sentinel exists so IntersectionObserver can trigger next page
+    expect(screen.getByTestId('comments-sentinel')).toBeInTheDocument();
+  });
+
+  it('reserves scroll height with a placeholder per unloaded top-level comment', async () => {
+    const totalKids = TOP_LEVEL_PAGE_SIZE + 5;
+    const kidIds = Array.from({ length: totalKids }, (_, i) => 1000 + i);
+    const items: Record<number, HNItem | null> = {
+      500: makeStory(500, { kids: kidIds, descendants: totalKids }),
+    };
+    for (const kid of kidIds) {
+      items[kid] = {
+        id: kid,
+        type: 'comment',
+        by: `u${kid}`,
+        text: `comment ${kid}`,
+        time: 1,
+      };
+    }
+    installHNFetchMock({ items });
+
+    renderWithProviders(<Thread id={500} />);
+
+    await waitFor(() => {
+      expect(screen.getByText('comment 1000')).toBeInTheDocument();
+    });
+    // The 5 top-level kids past the first page render as height-reserving
+    // placeholders rather than being absent, so the full row count — and
+    // therefore the scroll height — is established at load time instead of
+    // growing page-by-page as the reader scrolls.
+    const placeholders = screen.getByTestId('comments-placeholders');
+    expect(placeholders.querySelectorAll('.comment--placeholder')).toHaveLength(
+      5,
+    );
+  });
+
+  it('converts placeholders to real comments as the sentinel loads more', async () => {
+    installIntersectionObserverMock();
+    try {
+      const totalKids = TOP_LEVEL_PAGE_SIZE + 5;
+      const kidIds = Array.from({ length: totalKids }, (_, i) => 1000 + i);
+      const items: Record<number, HNItem | null> = {
+        500: makeStory(500, { kids: kidIds, descendants: totalKids }),
+      };
+      for (const kid of kidIds) {
+        items[kid] = {
+          id: kid,
+          type: 'comment',
+          by: `u${kid}`,
+          text: `comment ${kid}`,
+          time: 1,
+        };
+      }
+      installHNFetchMock({ items });
+
+      renderWithProviders(<Thread id={500} />);
+
+      // The mock observer reports the sentinel as intersecting, so the next
+      // page loads and the trailing placeholders become real comments.
+      await waitFor(() => {
+        expect(
+          screen.getByText(`comment ${1000 + totalKids - 1}`),
+        ).toBeInTheDocument();
+      });
+      // Everything is loaded now: no reserved placeholders, no sentinel.
+      expect(screen.queryByTestId('comments-placeholders')).toBeNull();
+      expect(screen.queryByTestId('comments-sentinel')).toBeNull();
+    } finally {
+      uninstallIntersectionObserverMock();
+    }
+  });
+
+  describe('when the item is a comment', () => {
+    function makeCommentTree(now: number): Record<number, HNItem> {
+      return {
+        500: makeStory(500, { title: 'Root story', kids: [501] }),
+        501: {
+          id: 501,
+          type: 'comment',
+          by: 'alice',
+          time: now - 60,
+          text: 'top comment <b>body</b>',
+          parent: 500,
+          kids: [502],
+        },
+        502: {
+          id: 502,
+          type: 'comment',
+          by: 'bob',
+          time: now - 30,
+          text: 'reply to alice',
+          parent: 501,
+        },
+      };
+    }
+
+    it('renders the focused comment expanded with article context above and replies via <Comment>', async () => {
+      const now = Math.floor(Date.now() / 1000);
+      installHNFetchMock({ items: makeCommentTree(now) });
+
+      renderWithProviders(<Thread id={501} />, { route: '/item/501' });
+
+      // Eyebrow upgrades to "Comment on" once the parent walk resolves
+      // a story, so the title heading below completes the phrase.
+      await waitFor(() => {
+        expect(screen.getByText('Comment on')).toBeInTheDocument();
+      });
+      // Author renders as the standard <Comment> author link.
+      expect(screen.getByRole('link', { name: 'alice' })).toHaveAttribute(
+        'href',
+        '/user/alice',
+      );
+      // Comment body renders sanitized HTML through <Comment>.
+      expect(document.body.innerHTML).toContain('<b>body</b>');
+
+      // No story-only chrome.
+      expect(
+        screen.queryByRole('link', { name: /read article/i }),
+      ).toBeNull();
+      expect(screen.queryByText(/\[untitled\]/)).toBeNull();
+      expect(screen.queryByText(/not eligible for summary/i)).toBeNull();
+
+      // Root story title is surfaced as a heading link to /item/500.
+      const titleLink = await screen.findByRole('link', { name: 'Root story' });
+      expect(titleLink).toHaveAttribute('href', '/item/500');
+
+      // The focused comment is expanded by default — its body is NOT
+      // clamped, and its action toolbar is visible. Pull the body via
+      // the (b)old text we know is inside the comment payload.
+      const bold = await screen.findByText('body');
+      const focusedBody = bold.closest('.comment__body');
+      expect(focusedBody).not.toBeNull();
+      expect(focusedBody).not.toHaveClass('comment__body--clamped');
+      // "Reply on HN" is part of the expanded toolbar — proves the
+      // toolbar rendered, distinguishing expanded from collapsed.
+      expect(
+        screen.getByRole('link', { name: /reply on hn/i }),
+      ).toBeInTheDocument();
+
+      // The focused comment's reply ("reply to alice") renders via the
+      // recursive <Comment> tree, in the default collapsed state.
+      const replyText = await screen.findByText(/reply to alice/);
+      const replyBody = replyText.closest('.comment__body');
+      expect(replyBody).toHaveClass('comment__body--clamped');
+    });
+
+    it('renders a "Summarize article" button (lazy) on the comment view, replaced by the SummaryCard once tapped', async () => {
+      const now = Math.floor(Date.now() / 1000);
+      let summaryCalls = 0;
+      const items = makeCommentTree(now);
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async (input: RequestInfo | URL) => {
+          const url = String(input);
+          if (url.includes('/api/summary')) {
+            summaryCalls++;
+            return new Response(
+              JSON.stringify({ summary: 'Concise article summary.' }),
+              { status: 200, headers: { 'content-type': 'application/json' } },
+            );
+          }
+          if (url.includes('/api/items')) {
+            const parsed = new URL(url, 'http://localhost');
+            const ids = (parsed.searchParams.get('ids') ?? '')
+              .split(',')
+              .map(Number)
+              .filter(Number.isFinite);
+            return new Response(
+              JSON.stringify(ids.map((i) => items[i] ?? null)),
+              { status: 200, headers: { 'content-type': 'application/json' } },
+            );
+          }
+          const m = url.match(/\/v0\/item\/(\d+)\.json$/);
+          if (m) {
+            const id = Number(m[1]);
+            return new Response(JSON.stringify(items[id] ?? null), {
+              status: 200,
+              headers: { 'content-type': 'application/json' },
+            });
+          }
+          return new Response('not found', { status: 404 });
+        }),
+      );
+
+      renderWithProviders(<Thread id={501} />, { route: '/item/501' });
+
+      // Button shows up once the parent walk has resolved the root story.
+      const button = await screen.findByTestId('lazy-summarize-button');
+      expect(button).toHaveTextContent(/summarize article/i);
+      // Crucially, no /api/summary call has fired yet — it's gated behind
+      // the user's explicit tap.
+      expect(summaryCalls).toBe(0);
+      expect(screen.queryByTestId('thread-summary-card')).toBeNull();
+
+      await userEvent.click(button);
+
+      // After tap: the SummaryCard mounts, fetches, and the button is gone.
+      expect(await screen.findByTestId('thread-summary-card')).toBeInTheDocument();
+      expect(screen.queryByTestId('lazy-summarize-button')).toBeNull();
+      await waitFor(() => {
+        expect(summaryCalls).toBeGreaterThanOrEqual(1);
+      });
+      expect(screen.getByText(/concise article summary/i)).toBeInTheDocument();
+    });
+
+    it('does not render the lazy Summarize button when the root story has no url and no self-post body', async () => {
+      const now = Math.floor(Date.now() / 1000);
+      installHNFetchMock({
+        items: {
+          // Self-post-less story (no url, no text) — nothing to summarize,
+          // so the button should be suppressed.
+          600: {
+            id: 600,
+            type: 'story',
+            title: 'Linkless and bodyless',
+            by: 'alice',
+            time: now - 60,
+          },
+          601: {
+            id: 601,
+            type: 'comment',
+            by: 'alice',
+            time: now - 30,
+            text: 'comment under bodyless story',
+            parent: 600,
+          },
+        },
+      });
+
+      renderWithProviders(<Thread id={601} />, { route: '/item/601' });
+
+      // Wait for the parent walk to resolve so we know the suppression is
+      // intentional, not just "still loading".
+      await screen.findByRole('link', { name: 'Linkless and bodyless' });
+      expect(screen.queryByTestId('lazy-summarize-button')).toBeNull();
+    });
+
+    it('still renders the focused comment when the parent walk fails to find a story (no title, no Summarize button)', async () => {
+      const now = Math.floor(Date.now() / 1000);
+      installHNFetchMock({
+        items: {
+          // 501's parent is 500, but 500 is missing — walk hits a dead
+          // end and returns null.
+          501: {
+            id: 501,
+            type: 'comment',
+            by: 'alice',
+            time: now - 60,
+            text: 'orphaned',
+            parent: 500,
+          },
+        },
+      });
+
+      renderWithProviders(<Thread id={501} />, { route: '/item/501' });
+
+      // Eyebrow stays plain "Comment" while there's no resolved story
+      // to follow it.
+      await waitFor(() => {
+        expect(screen.getByText('Comment')).toBeInTheDocument();
+      });
+      expect(screen.queryByText('Comment on')).toBeNull();
+      // Story chrome is suppressed — no title heading, no Summarize.
+      expect(screen.queryByRole('link', { name: 'Root story' })).toBeNull();
+      expect(screen.queryByTestId('lazy-summarize-button')).toBeNull();
+      // The focused comment itself still renders via <Comment>.
+      expect(
+        screen.getByRole('link', { name: 'alice' }),
+      ).toBeInTheDocument();
+      expect(await screen.findByText(/orphaned/)).toBeInTheDocument();
+    });
+  });
+
+  // Regression: PersistQueryClientProvider parks queries with
+  // fetchStatus 'idle' while it rehydrates from localStorage on first
+  // paint, so React Query's `isLoading` (= `isPending && isFetching`)
+  // is false even though no fetch has run yet. <Thread> gates the
+  // skeleton on `isPending` (true whenever there's no data, regardless
+  // of why) precisely so the `!data || !item` "Item not found." branch
+  // can't flash through this window.
+  it('shows the loading skeleton (not "Item not found.") while React Query is restoring from persisted cache', () => {
+    const client = new QueryClient({
+      defaultOptions: {
+        queries: {
+          retry: false,
+          gcTime: 0,
+          staleTime: 0,
+          networkMode: 'offlineFirst',
+        },
+      },
+    });
+    // Don't install an HN fetch mock — during restore, no fetch should
+    // fire, and we want to assert on the synchronous first render.
+    render(
+      <QueryClientProvider client={client}>
+        <IsRestoringProvider value={true}>
+          <MemoryRouter initialEntries={['/item/777']}>
+            <FeedBarProvider>
+              <Thread id={777} />
+            </FeedBarProvider>
+          </MemoryRouter>
+        </IsRestoringProvider>
+      </QueryClientProvider>,
+    );
+    expect(screen.queryByText(/Item not found\./)).toBeNull();
+    expect(
+      screen.getByLabelText('Loading thread'),
+    ).toHaveAttribute('aria-busy', 'true');
+  });
+});
+
+describe('<Thread> open instrumentation', () => {
+  beforeEach(() => {
+    _resetThreadOpenStatsForTests();
+  });
+  afterEach(() => {
+    _resetThreadOpenStatsForTests();
+    vi.unstubAllGlobals();
+  });
+
+  it('records a cold open as root-not-cached once content commits', async () => {
+    installHNFetchMock({
+      items: {
+        700: makeStory(700, { title: 'Cold open', descendants: 0 }),
+      },
+    });
+    renderWithProviders(<Thread id={700} />, { route: '/item/700' });
+    await waitFor(() => {
+      expect(screen.getByText('Cold open')).toBeInTheDocument();
+    });
+    const records = getThreadOpenRecords();
+    expect(records).toHaveLength(1);
+    expect(records[0].id).toBe(700);
+    expect(records[0].rootCached).toBe(false);
+    expect(records[0].waitedMs).toBeGreaterThanOrEqual(0);
+  });
+
+  it('stamps the initial-route thread open with the time since page load', async () => {
+    // A Thread whose id matches the URL the page loaded on IS the page
+    // load (reload / deep link), however long JS/restore/hydrate took
+    // before it mounted — identified by the initial route, not a time
+    // window. The record carries the wall-clock total since navigation
+    // start.
+    _resetThreadOpenStatsForTests(702);
+    installHNFetchMock({
+      items: {
+        702: makeStory(702, { title: 'Reload open', descendants: 0 }),
+      },
+    });
+    renderWithProviders(<Thread id={702} />, { route: '/item/702' });
+    await waitFor(() => {
+      expect(screen.getByText('Reload open')).toBeInTheDocument();
+    });
+    const records = getThreadOpenRecords();
+    expect(records).toHaveLength(1);
+    expect(records[0].sinceNavMs).toBeGreaterThanOrEqual(0);
+    // The root was fetched during this page load (mirroring the entry
+    // module's deep-link prefetch racing the mount), so a boot open must
+    // not call it cached — only data predating navigation start is.
+    expect(records[0].rootCached).toBe(false);
+  });
+
+  it('counts persisted-blob data as cached for a boot open', async () => {
+    // Data stamped before navigation start can only have come from the
+    // persisted cache hydrating — the one source a boot open's wait
+    // didn't fetch.
+    _resetThreadOpenStatsForTests(705);
+    installHNFetchMock({
+      items: {
+        705: makeStory(705, { title: 'Hydrated open', descendants: 0 }),
+      },
+    });
+    const client = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false, gcTime: 0, staleTime: Infinity },
+      },
+    });
+    client.setQueryData(
+      ['itemRoot', 705],
+      {
+        item: makeStory(705, { title: 'Hydrated open', descendants: 0 }),
+        kidIds: [],
+      },
+      // Stamped before this page's timeOrigin, as a hydrated blob is.
+      { updatedAt: 1 },
+    );
+    renderWithProviders(<Thread id={705} />, { route: '/item/705', client });
+    await waitFor(() => {
+      expect(screen.getByText('Hydrated open')).toBeInTheDocument();
+    });
+    const records = getThreadOpenRecords();
+    expect(records).toHaveLength(1);
+    expect(records[0].rootCached).toBe(true);
+    expect(records[0].sinceNavMs).toBeGreaterThanOrEqual(0);
+  });
+
+  it('does not stamp an in-app open with a page-load total', async () => {
+    // The page loaded on a feed URL, so this open — however soon after
+    // load — is an in-app navigation, not a boot.
+    _resetThreadOpenStatsForTests(null);
+    installHNFetchMock({
+      items: {
+        703: makeStory(703, { title: 'In-app open', descendants: 0 }),
+      },
+    });
+    renderWithProviders(<Thread id={703} />, { route: '/item/703' });
+    await waitFor(() => {
+      expect(screen.getByText('In-app open')).toBeInTheDocument();
+    });
+    expect(getThreadOpenRecords()[0].sinceNavMs).toBeUndefined();
+  });
+
+  it('spends the boot-open claim at mount even when the open never records', async () => {
+    // The page loaded on /item/706 but the fetch failed and the reader
+    // left. A later in-app mount of the same story must not inherit the
+    // page-load classification — its sinceNavMs would span the session.
+    _resetThreadOpenStatsForTests(706);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response('down', { status: 500 })),
+    );
+    const first = renderWithProviders(<Thread id={706} />, {
+      route: '/item/706',
+    });
+    await waitFor(() => {
+      expect(
+        screen.getByRole('button', { name: /retry/i }),
+      ).toBeInTheDocument();
+    });
+    expect(getThreadOpenRecords()).toHaveLength(0);
+    first.unmount();
+
+    installHNFetchMock({
+      items: {
+        706: makeStory(706, { title: 'Second visit', descendants: 0 }),
+      },
+    });
+    renderWithProviders(<Thread id={706} />, { route: '/item/706' });
+    await waitFor(() => {
+      expect(screen.getByText('Second visit')).toBeInTheDocument();
+    });
+    const records = getThreadOpenRecords();
+    expect(records).toHaveLength(1);
+    expect(records[0].sinceNavMs).toBeUndefined();
+  });
+
+  it('does not record an error state, and records the full wait after a retry succeeds', async () => {
+    // The root fetch failing flips isPending without content — that is
+    // not an open. The record must land only when content commits, with
+    // the wait spanning the failed attempt too.
+    const failingFetch = vi.fn(async () =>
+      new Response('upstream down', { status: 500 }),
+    );
+    vi.stubGlobal('fetch', failingFetch);
+    renderWithProviders(<Thread id={704} />, { route: '/item/704' });
+    await waitFor(() => {
+      expect(
+        screen.getByRole('button', { name: /retry/i }),
+      ).toBeInTheDocument();
+    });
+    expect(getThreadOpenRecords()).toHaveLength(0);
+
+    installHNFetchMock({
+      items: {
+        704: makeStory(704, { title: 'Recovered open', descendants: 0 }),
+      },
+    });
+    const user = userEvent.setup();
+    await user.click(screen.getByRole('button', { name: /retry/i }));
+    await waitFor(() => {
+      expect(screen.getByText('Recovered open')).toBeInTheDocument();
+    });
+    const records = getThreadOpenRecords();
+    expect(records).toHaveLength(1);
+    expect(records[0].id).toBe(704);
+  });
+
+  it('records a warm open as root-cached when the query cache already holds the root', async () => {
+    installHNFetchMock({
+      items: {
+        701: makeStory(701, { title: 'Warm open', descendants: 0 }),
+      },
+    });
+    const client = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false, gcTime: 0, staleTime: Infinity },
+      },
+    });
+    client.setQueryData(['itemRoot', 701], {
+      item: makeStory(701, { title: 'Warm open', descendants: 0 }),
+      kidIds: [],
+    });
+    renderWithProviders(<Thread id={701} />, { route: '/item/701', client });
+    await waitFor(() => {
+      expect(screen.getByText('Warm open')).toBeInTheDocument();
+    });
+    const records = getThreadOpenRecords();
+    expect(records).toHaveLength(1);
+    expect(records[0].rootCached).toBe(true);
+  });
+});

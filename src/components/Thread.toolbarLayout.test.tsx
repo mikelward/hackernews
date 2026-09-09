@@ -1,0 +1,308 @@
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { screen } from '@testing-library/react';
+import { Thread } from './Thread';
+import { renderWithProviders } from '../test/renderUtils';
+import { installHNFetchMock, makeStory } from '../test/mockFetch';
+
+// Regression guard for the bug where the bottom thread action bar
+// wrapped the ⋮ button onto a second row on ordinary phones (a Pixel
+// 10 at 412px, for one) while the top bar fit everything on one row.
+// The earlier fix used a `@media (max-width: 480px)` rule that forced
+// the stretch slot to `flex-basis: 100%`, which made *both* bars take
+// two rows on every common phone — not what we want. This file pins
+// down the actual invariant: at every realistic phone width, the
+// entire thread action bar fits on a single row. We rely on the
+// stretch slot's `flex: 1; min-width: 0` + `.thread__action-label`'s
+// `text-overflow: ellipsis` to absorb the width pressure.
+
+// ---- CSS-layer constants. Keep in sync with Thread.css. ----
+const ICON_BUTTON_WIDTH = 44; // .thread__action--icon width (touch base)
+const STRETCH_MIN_WIDTH = 0; // flex: 1; min-width: 0 → shrinks to 0
+const GAP = 12; // .thread__actions gap
+const HEADER_PADDING_X = 16; // .thread__header / .thread__footer padding
+
+// Simulates CSS `flex-wrap: wrap` with `gap`. Returns the number of
+// rows required to fit the items in the container.
+function simulateFlexWrap(
+  containerWidth: number,
+  itemMinWidths: number[],
+  gap: number,
+): number {
+  let rows = 1;
+  let rowWidth = 0;
+  for (const w of itemMinWidths) {
+    const next = rowWidth === 0 ? w : rowWidth + gap + w;
+    if (next > containerWidth) {
+      rows += 1;
+      rowWidth = w;
+    } else {
+      rowWidth = next;
+    }
+  }
+  return rows;
+}
+
+// Logical model of the thread action bar: one stretch slot (min-width 0)
+// plus N fixed-width icon buttons. Top bar on self-posts has no stretch
+// slot (Read article is hidden).
+function simulateActionBarRows(
+  viewportWidth: number,
+  iconButtonCount: number,
+  hasStretchSlot: boolean,
+): number {
+  const available = viewportWidth - HEADER_PADDING_X * 2;
+  const items: number[] = [];
+  if (hasStretchSlot) items.push(STRETCH_MIN_WIDTH);
+  for (let i = 0; i < iconButtonCount; i += 1) items.push(ICON_BUTTON_WIDTH);
+  return simulateFlexWrap(available, items, GAP);
+}
+
+// Real-device-ish viewport matrix. iPhone SE 1st gen at 320px is the
+// narrowest; Pixel 10 at 412px is the specific device the regression
+// came from; the rest cover common phones / folding phones / iPads in
+// split view. No browser zoom cases (those are user-opt-in and can
+// accept wrapping).
+const PHONE_VIEWPORTS = [320, 360, 375, 390, 412, 414, 430];
+const TABLET_VIEWPORTS = [480, 500, 600, 768, 1024];
+const ALL_VIEWPORTS = [...PHONE_VIEWPORTS, ...TABLET_VIEWPORTS];
+
+describe('<Thread> action bar row count across viewports (logical model)', () => {
+  // URL-backed story: stretch slot + 4 icon buttons (Upvote, Pin, Done,
+  // More). The Upvote button is now always visible — taps from a
+  // logged-out viewer open the login dialog instead of being hidden —
+  // so the logged-in and logged-out bars share the same width budget.
+  const iconCount = 4;
+
+  for (const w of ALL_VIEWPORTS) {
+    it(`fits on a single row at ${w}px viewport (with Upvote)`, () => {
+      expect(simulateActionBarRows(w, iconCount, true)).toBe(1);
+    });
+  }
+
+  it('fits on a single row on self-posts (no stretch slot on the top bar)', () => {
+    // Self-posts: top bar has no Read article → just the icon buttons.
+    for (const w of ALL_VIEWPORTS) {
+      expect(simulateActionBarRows(w, iconCount, false)).toBe(1);
+    }
+  });
+
+  // A stretch slot with min-width 0 cannot by itself push the bar to a
+  // second row: only the fixed-width icon buttons force a wrap. Pin
+  // that down so a future change to the stretch slot's min-width
+  // doesn't silently re-introduce the Pixel-10 bug.
+  it('the stretch slot contributes zero min-width pressure', () => {
+    for (const w of ALL_VIEWPORTS) {
+      const withStretch = simulateActionBarRows(w, iconCount, true);
+      const withoutStretch = simulateActionBarRows(w, iconCount, false);
+      expect(withStretch).toBe(withoutStretch);
+    }
+  });
+});
+
+describe('<Thread> action bar structural parity (rendered)', () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+  });
+
+  afterEach(() => {
+    window.localStorage.clear();
+  });
+
+  it('bottom bar mirrors the top bar: same stretch slot, same icon buttons in the same order', async () => {
+    installHNFetchMock({
+      items: {
+        9100: makeStory(9100, { title: 'Parity', url: 'https://example.com/9100' }),
+      },
+    });
+
+    renderWithProviders(<Thread id={9100} />, { route: '/item/9100' });
+    await screen.findByText('Parity');
+
+    const topStretch = screen.getByTestId('thread-read-article');
+    const bottomStretch = screen.getByTestId('thread-back-to-top-bottom');
+    expect(topStretch.className).toContain('thread__action--primary');
+    expect(bottomStretch.className).toContain('thread__action--stretch');
+
+    // Icon buttons are the same in both bars, in the same order.
+    expect(screen.getByTestId('thread-pin')).toBeInTheDocument();
+    expect(screen.getByTestId('thread-pin-bottom')).toBeInTheDocument();
+    expect(screen.getByTestId('thread-done')).toBeInTheDocument();
+    expect(screen.getByTestId('thread-done-bottom')).toBeInTheDocument();
+    expect(screen.getByTestId('thread-more')).toBeInTheDocument();
+    expect(screen.getByTestId('thread-more-bottom')).toBeInTheDocument();
+  });
+
+  it('Back to top has a visible label that ellipsis-truncates under pressure', async () => {
+    installHNFetchMock({
+      items: {
+        9110: makeStory(9110, { title: 'WithLabel', url: 'https://example.com/9110' }),
+      },
+    });
+
+    renderWithProviders(<Thread id={9110} />, { route: '/item/9110' });
+    await screen.findByText('WithLabel');
+
+    const backToTop = screen.getByTestId('thread-back-to-top-bottom');
+    // The label IS rendered (so sighted users see "Back to top" when
+    // there's room for it), and wears the `.thread__action-label` class
+    // that carries `overflow: hidden; text-overflow: ellipsis;
+    // white-space: nowrap` — that's what absorbs width pressure on
+    // narrow phones without forcing the icon row onto a second row.
+    const label = backToTop.querySelector('.thread__action-label');
+    expect(label).not.toBeNull();
+    expect(label!.textContent).toBe('Back to top');
+  });
+
+  it('Ask HN top bar has no stretch slot, so alignment must come from the row', async () => {
+    // Self-post (no url): the top bar renders neither Read article
+    // (--primary) nor Back to top (--stretch), so nothing with `flex: 1`
+    // holds the icon buttons over to the right. Right-alignment has to
+    // come from `.thread__actions { justify-content: flex-end }` instead
+    // — asserted as a CSS invariant below. This test pins the precondition
+    // (no stretch slot on an Ask HN top bar) so that invariant stays load-
+    // bearing.
+    installHNFetchMock({
+      items: {
+        9130: makeStory(9130, { title: 'Ask HN: no url', url: undefined }),
+      },
+    });
+
+    renderWithProviders(<Thread id={9130} />, { route: '/item/9130' });
+    await screen.findByText('Ask HN: no url');
+
+    const header = document.querySelector('.thread__header');
+    expect(header).not.toBeNull();
+    // No primary/stretch button in the top bar for a self-post.
+    expect(
+      header!.querySelector('.thread__action--primary'),
+    ).toBeNull();
+    expect(
+      header!.querySelector('.thread__action--stretch'),
+    ).toBeNull();
+    // The icon buttons are still present — they just need right-aligning.
+    expect(screen.getByTestId('thread-vote')).toBeInTheDocument();
+    expect(screen.getByTestId('thread-pin')).toBeInTheDocument();
+    expect(screen.getByTestId('thread-done')).toBeInTheDocument();
+    expect(screen.getByTestId('thread-more')).toBeInTheDocument();
+  });
+
+  it('both bars contain the same number of tap targets', async () => {
+    installHNFetchMock({
+      items: {
+        9120: makeStory(9120, {
+          title: 'EqualCount',
+          url: 'https://example.com/9120',
+        }),
+      },
+    });
+
+    renderWithProviders(<Thread id={9120} />, { route: '/item/9120' });
+    await screen.findByText('EqualCount');
+
+    const header = document.querySelector('.thread__header');
+    const footer = document.querySelector('.thread__footer');
+    expect(header).not.toBeNull();
+    expect(footer).not.toBeNull();
+    const topActions = header!.querySelectorAll('.thread__action');
+    const bottomActions = footer!.querySelectorAll('.thread__action');
+    expect(bottomActions.length).toBe(topActions.length);
+  });
+});
+
+describe('<Thread> action bar CSS invariants', () => {
+  // The Pixel 10 regression came from a `@media (max-width: 480px) {
+  // .thread__action--primary { flex-basis: 100%; } }` rule. If that
+  // ever comes back, the bar takes two rows on every common phone
+  // instead of relying on label ellipsis to fit on one row. This
+  // pins it down via a raw-CSS check: no `flex-basis: 100%` on the
+  // thread action classes.
+  it('does not force a row-wrap via flex-basis: 100% on --primary or --stretch', async () => {
+    const { readFileSync } = await import('node:fs');
+    const { fileURLToPath } = await import('node:url');
+    const { dirname, resolve } = await import('node:path');
+    const here = dirname(fileURLToPath(import.meta.url));
+    const css = readFileSync(resolve(here, 'Thread.css'), 'utf8');
+    expect(css).not.toMatch(
+      /\.thread__action--(?:primary|stretch)[^{]*\{[^}]*flex-basis:\s*100%/s,
+    );
+    // Also guard the @media-scoped variant explicitly.
+    expect(css).not.toMatch(
+      /@media[^{]*\{\s*\.thread__action--(?:primary|stretch)\s*\{[^}]*flex-basis:\s*100%/s,
+    );
+  });
+
+  // The action row must right-align its contents. On URL-backed stories
+  // the primary/stretch slot's `flex: 1` fills the free space, so
+  // justify-content is a no-op; but on Ask HN / self-posts there's no
+  // such slot, and without `justify-content: flex-end` the icon buttons
+  // (Upvote/Pin/Done/⋮) fall back to flex-start and sit flush-left. Pin
+  // the declaration on `.thread__actions` so the self-post bar keeps its
+  // actions on the right.
+  it('right-aligns the action row via justify-content: flex-end', async () => {
+    const { readFileSync } = await import('node:fs');
+    const { fileURLToPath } = await import('node:url');
+    const { dirname, resolve } = await import('node:path');
+    const here = dirname(fileURLToPath(import.meta.url));
+    const css = readFileSync(resolve(here, 'Thread.css'), 'utf8');
+    expect(css).toMatch(
+      /\.thread__actions\s*\{[^}]*justify-content:\s*flex-end/s,
+    );
+  });
+
+  // The mobile 56px button height is tuned for fingertips; on a
+  // mouse/trackpad it reads as oversized at any window width. The
+  // pointer-gated block in Thread.css shrinks the icon buttons and
+  // their glyphs (to 36px boxes / 20px glyphs). It is deliberately
+  // gated on `(hover: hover)` — pointer type, NOT viewport width — so a
+  // mouse user gets the denser bar even in a narrow window while touch
+  // devices keep the 56px (≥48 tap-target floor) at every width. The
+  // primary/stretch slot is left UNCAPPED so the bar stays full-width
+  // edge to edge. Pin all of that down here so a refactor can't
+  // silently drop the shrink, swap it back to a width gate, or
+  // re-introduce a width cap.
+  it('shrinks the icon buttons for pointer devices (hover-gated, not width) and leaves them uncapped', async () => {
+    const { readFileSync } = await import('node:fs');
+    const { fileURLToPath } = await import('node:url');
+    const { dirname, resolve } = await import('node:path');
+    const here = dirname(fileURLToPath(import.meta.url));
+    const css = readFileSync(resolve(here, 'Thread.css'), 'utf8');
+
+    // Locate the sizing block by its unique `min-height: 36px`
+    // declaration, then walk back to the enclosing `@media` prelude.
+    // (Anchoring on the declaration rather than the media text keeps the
+    // test robust even though the file has several `@media (hover: hover)`
+    // blocks — only the sizing one carries this declaration.)
+    const sizeDecl = css.indexOf('min-height: 36px');
+    expect(sizeDecl, 'expected a min-height: 36px sizing rule').toBeGreaterThanOrEqual(0);
+    const start = css.lastIndexOf('@media', sizeDecl);
+    expect(start).toBeGreaterThanOrEqual(0);
+    const braceStart = css.indexOf('{', start);
+    expect(braceStart).toBeGreaterThan(start);
+    expect(braceStart).toBeLessThan(sizeDecl);
+    const prelude = css.slice(start, braceStart);
+    // Pointer-gated, not width-gated.
+    expect(prelude).toMatch(/hover:\s*hover/);
+    expect(prelude).not.toMatch(/min-width/);
+
+    let depth = 1;
+    let i = braceStart + 1;
+    while (i < css.length && depth > 0) {
+      if (css[i] === '{') depth += 1;
+      else if (css[i] === '}') depth -= 1;
+      i += 1;
+    }
+    expect(depth).toBe(0);
+    // Strip CSS comments before the declaration checks — a comment in
+    // the block references `svg { max-width: 100% }`, which is prose,
+    // not a rule we're asserting against.
+    const body = css
+      .slice(braceStart + 1, i - 1)
+      .replace(/\/\*[\s\S]*?\*\//g, '');
+
+    // The icon buttons shrink, and the inline glyphs shrink with them.
+    expect(body).toMatch(/\.thread__action--icon[\s\S]{0,200}width\s*:/);
+    expect(body).toMatch(/\.thread__action-icon[\s\S]{0,200}width\s*:/);
+    // No width cap on the primary/stretch slot — the bar fills the row.
+    expect(body).not.toMatch(/max-width/);
+  });
+});

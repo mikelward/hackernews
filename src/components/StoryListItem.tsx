@@ -1,0 +1,578 @@
+import { useCallback, useMemo, useRef, useState } from 'react';
+import type { KeyboardEvent, MouseEvent, ReactNode } from 'react';
+import { Link } from 'react-router';
+import type { HNItem } from '../lib/hn';
+import {
+  formatDisplayDomain,
+  formatStoryMetaTail,
+  isHotStory,
+  isSafeHttpUrl,
+} from '../lib/format';
+import { markArticleOpenedId } from '../lib/openedStories';
+import { usePointerDevice } from '../hooks/usePointerDevice';
+import { useWideViewport } from '../hooks/useWideViewport';
+import { useDoneStories } from '../hooks/useDoneStories';
+import { useSwipeToDismiss } from '../hooks/useSwipeToDismiss';
+import { StoryRowMenu, type StoryRowMenuItem } from './StoryRowMenu';
+import { TooltipButton } from './TooltipButton';
+import './StoryListItem.css';
+
+export type RowFlag = 'hot' | 'new' | null;
+
+interface Props {
+  story: HNItem;
+  rank?: number;
+  articleOpened?: boolean;
+  commentsOpened?: boolean;
+  /**
+   * Total comment count at the moment the reader last opened the
+   * thread. When provided, the row's meta shows a ` · N new` segment
+   * for any extra comments posted since.
+   */
+  seenCommentCount?: number;
+  pinned?: boolean;
+  /**
+   * Renders the "Hidden" swipe-hint label behind the row's right
+   * edge and suppresses the "Pin" action hint there (swipe-left on
+   * a hidden row rubber-bands — pin-on-hidden is blocked). Set by
+   * LibraryStoryList when `hiddenIds.has(story.id)`. The row itself
+   * is not dimmed — the pin ∩ hidden invariant removed the need for
+   * a separate visual state; this prop is strictly the hint driver.
+   */
+  hidden?: boolean;
+  onHide?: (id: number) => void;
+  onPin?: (id: number) => void;
+  onUnpin?: (id: number) => void;
+  onShare?: (story: HNItem) => void;
+  onMarkUnread?: (id: number) => void;
+  onOpenThread?: (id: number) => void;
+  /**
+   * Per-row override for the trailing flag segment in the meta line.
+   * Default behavior (prop omitted or `undefined`): the row auto-
+   * computes via `isHotStory(story)` and renders `hot` when true,
+   * nothing otherwise — every standard feed (Top, New, Best, Ask,
+   * Show, Jobs) leaves this prop unset so behavior is unchanged.
+   * `null` suppresses the auto-computed flag without substituting
+   * anything (used on `/hot` for `/top`-source rows, where every
+   * row is hot by construction so the literal `hot` text is noise).
+   * `'new'` forces the segment to render the literal `new` (used on
+   * `/hot` for rows that came from the `/new` source and were not
+   * also in the `/top` slice — the temporary debug affordance from
+   * SPEC.md *Hot flag*). `'hot'` is included in the type for
+   * symmetry but no caller currently forces it.
+   */
+  flag?: RowFlag;
+  /**
+   * Replaces the default Pin/Unpin button on the right side of the row
+   * with a view-contextual action — used by library views (/done,
+   * /favorites, /hidden) where every visible row already has the state
+   * the button represents, so the "primary" row action is the inverse
+   * (Unmark done, Unfavorite, Unhide) rather than Pin. The button
+   * paints in the `--active` orange state by default (matching every
+   * library view's filled-icon affordance); callers that want a
+   * non-orange "informational / inactive" variant — e.g. the /tuning
+   * Preview's hollow-pin button on a row the rule matches but the
+   * operator hasn't engaged with — pass `active: false` to opt out.
+   * See SPEC.md § "Library views" for the default-case rationale.
+   */
+  rightAction?: {
+    label: string;
+    icon: ReactNode;
+    onToggle: () => void;
+    testId?: string;
+    /**
+     * When explicitly false, the button renders without the
+     * `pin-btn--active` orange tint — used for "informational
+     * inactive" affordances (e.g. the /tuning Preview's
+     * read-only hollow-pin variant). Default true preserves
+     * backwards compat: every existing rightAction caller
+     * (library views, exclam icons) wants the orange paint.
+     */
+    active?: boolean;
+  };
+  /**
+   * When true, the meta line tucks points-per-hour into the
+   * points segment as an inline parenthetical — "1h · 50 points
+   * (25/h) · 10 comments". Off by default; only the /tuning
+   * Preview enables it (where the operator is explicitly
+   * looking at velocity for threshold tuning). Inline rather
+   * than a separate dot-segment so the row stays tight on
+   * narrow phones.
+   */
+  showVelocity?: boolean;
+  /**
+   * When true, the row binds no pointer-driven mutation
+   * handlers: the long-press / right-click menu doesn't open
+   * (so the Pin / Hide / Share items are unreachable), and
+   * `useSwipeToDismiss` stays inert because all three of its
+   * handlers are undefined (`onSwipeRight`/`Left` already are
+   * when their commit handlers are absent; this flag also
+   * suppresses `onLongPress`). Used by the /tuning Preview, in
+   * conjunction with `StoryListImpl`'s own `readOnly` (which
+   * withholds the commit handlers themselves), so an operator
+   * tuning thresholds can't accidentally pin / hide a story by
+   * swiping or long-pressing a row.
+   */
+  readOnly?: boolean;
+  /**
+   * Marks the row as belonging to a library view (`/pinned`, `/favorites`,
+   * `/done`, `/hidden`, `/opened`). Library rows suppress the wide-viewport
+   * Done button in the row's reserved middle slot because the right-side
+   * button already names the row's intent (Unmark done, Unfavorite, …) —
+   * see SPEC.md § *Story row layout*. `rightAction` presence alone isn't a
+   * sufficient signal because `/pinned` keeps the default Pin/Unpin button,
+   * so `LibraryStoryList` always sets this prop regardless of `rightAction`.
+   */
+  isLibraryRow?: boolean;
+}
+
+export function StoryListItem({
+  story,
+  articleOpened = false,
+  commentsOpened = false,
+  seenCommentCount,
+  pinned = false,
+  hidden = false,
+  readOnly = false,
+  onHide,
+  onPin,
+  onUnpin,
+  onShare,
+  onMarkUnread,
+  onOpenThread,
+  rightAction,
+  flag,
+  showVelocity = false,
+  isLibraryRow = false,
+}: Props) {
+  const hasExternalUrl = !!story.url;
+  const domain = formatDisplayDomain(story.url);
+
+  const title = story.title ?? '[untitled]';
+  const domainLabel = hasExternalUrl ? domain : 'self post';
+
+  const newCommentCount =
+    seenCommentCount !== undefined
+      ? Math.max(0, (story.descendants ?? 0) - seenCommentCount)
+      : 0;
+
+  // `flag` prop overrides the auto-computed Hot segment when set:
+  // `null` suppresses the segment, `'new'` substitutes the literal
+  // text. When the prop is omitted, fall back to `isHotStory(story)`
+  // with the production defaults — but every list-rendering parent
+  // (`StoryListImpl`, `LibraryStoryList`) computes the flag once
+  // against the user's Hot customize panel overrides and passes it in,
+  // so the auto-compute path is only a defensive fallback for direct
+  // / test usage. Reading the per-user thresholds *here* would mean
+  // every rendered row registers its own `useHotThresholds` window
+  // listeners (custom event + storage), so the subscription is
+  // hoisted to the parent — see Copilot review on PR #240.
+  const flagText: 'hot' | 'new' | null =
+    flag === undefined ? (isHotStory(story) ? 'hot' : null) : flag;
+
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [menuAnchor, setMenuAnchor] = useState<HTMLElement | null>(null);
+  const articleRef = useRef<HTMLElement>(null);
+  const pointerDevice = usePointerDevice();
+  const wide = useWideViewport();
+  const { isDone, markDone, unmarkDone } = useDoneStories();
+  const done = isDone(story.id);
+
+  const handleHide = useCallback(() => {
+    onHide?.(story.id);
+  }, [onHide, story.id]);
+
+  const handlePin = useCallback(() => {
+    onPin?.(story.id);
+  }, [onPin, story.id]);
+
+  const handleUnpin = useCallback(() => {
+    onUnpin?.(story.id);
+  }, [onUnpin, story.id]);
+
+  const handleShare = useCallback(() => {
+    onShare?.(story);
+  }, [onShare, story]);
+
+  const handleMarkUnread = useCallback(() => {
+    onMarkUnread?.(story.id);
+  }, [onMarkUnread, story.id]);
+
+  const openMenu = useCallback(() => {
+    setMenuAnchor(articleRef.current);
+    setMenuOpen(true);
+  }, []);
+  const closeMenu = useCallback(() => setMenuOpen(false), []);
+
+  const handleOpenThread = useCallback(() => {
+    onOpenThread?.(story.id);
+  }, [onOpenThread, story.id]);
+
+  const handleTogglePin = useCallback(() => {
+    if (pinned) onUnpin?.(story.id);
+    else onPin?.(story.id);
+  }, [pinned, onPin, onUnpin, story.id]);
+
+  // Pin and Hide are mutually exclusive: a pinned row can't be hidden
+  // (swipe-right and the row-menu "Hide" item are suppressed) and a
+  // hidden row can't be pinned (swipe-left and the menu "Pin" item
+  // are suppressed when the caller marks the row as hidden; in
+  // practice LibraryStoryList decides that by withholding
+  // onPin/onUnpin from rows in `hiddenIds`). Additionally, a pinned
+  // row rejects swipe-left as well — both swipe directions are
+  // shielded on pinned rows, so a pin can't be re-timestamped
+  // (silent reordering) by a stray swipe. A pin exits via Done
+  // (normal lifecycle, clears the pin as a side effect — see
+  // useDoneStories) or via Unpin (explicit). A hide exits via the
+  // `/hidden` page's recover action or the feed-header Undo button.
+  //
+  // The suppressed gestures still *track* the finger and snap back
+  // on release — rubber-band feedback, not silent absorption. That
+  // comes for free from useSwipeToDismiss: the gesture activates
+  // whenever any handler is wired (long-press always is), the row
+  // translates as the finger moves, and on pointerup the direction
+  // whose `handler` is `undefined` falls through to the hook's
+  // snap-back branch. See SPEC.md under *Pinned vs. Favorite vs.
+  // Done*.
+  const { dragging, isDismissing, style, handlers } = useSwipeToDismiss({
+    onSwipeRight: onHide && !pinned ? handleHide : undefined,
+    onSwipeLeft: onPin && !pinned ? handlePin : undefined,
+    // `readOnly` suppresses long-press too. Combined with
+    // already-undefined swipe handlers (when StoryListImpl
+    // withholds onPin/onHide), `useSwipeToDismiss` sees no
+    // handlers wired and binds no pointer events at all
+    // (line ~71 in the hook gates everything on
+    // `hasAnyHandler`). The row no longer rubber-bands or
+    // intercepts contextmenu — fully inert under tuning.
+    onLongPress: readOnly ? undefined : openMenu,
+  });
+
+  // Right-click opens the same menu on pointer devices — the desktop
+  // equivalent of touch long-press. The swipe-to-dismiss hook's own
+  // onContextMenu already calls preventDefault when a long-press
+  // handler is wired; we compose on top of it and only act when the
+  // media query reports a hover-capable pointer, so we don't
+  // double-fire on mobile where long-press also opens the menu and
+  // the OS may fire a synthetic contextmenu.
+  const swipeOnContextMenu = handlers.onContextMenu;
+  const rowOpened = articleOpened || commentsOpened;
+  const hasAnyMenuItem = !!(
+    onHide ||
+    onPin ||
+    onUnpin ||
+    onShare ||
+    (rowOpened && onMarkUnread)
+  );
+  const handleContextMenu = useCallback(
+    (e: MouseEvent<HTMLElement>) => {
+      swipeOnContextMenu?.(e);
+      if (!pointerDevice || !hasAnyMenuItem) return;
+      e.preventDefault();
+      setMenuAnchor(articleRef.current);
+      setMenuOpen(true);
+    },
+    [swipeOnContextMenu, pointerDevice, hasAnyMenuItem],
+  );
+
+  const rowClass =
+    'story-row' +
+    (dragging ? ' story-row--dragging' : '') +
+    (isDismissing ? ' story-row--dismissing' : '') +
+    (rowOpened ? ' story-row--opened' : '');
+
+  const menuItems = useMemo<StoryRowMenuItem[]>(() => {
+    const items: StoryRowMenuItem[] = [];
+    if (pinned && onUnpin) {
+      items.push({ key: 'unpin', label: 'Unpin', onSelect: handleUnpin });
+    } else if (!pinned && onPin) {
+      items.push({ key: 'pin', label: 'Pin', onSelect: handlePin });
+    }
+    // Hide is suppressed on pinned rows — same rule as swipe-right.
+    // Pinned exits via Done (lifecycle) or Unpin (explicit).
+    if (onHide && !pinned) {
+      items.push({ key: 'hide', label: 'Hide', onSelect: handleHide });
+    }
+    if (rowOpened && onMarkUnread) {
+      items.push({
+        key: 'mark-unread',
+        label: 'Mark unread',
+        onSelect: handleMarkUnread,
+      });
+    }
+    if (onShare) {
+      items.push({ key: 'share', label: 'Share', onSelect: handleShare });
+    }
+    return items;
+  }, [
+    pinned,
+    onPin,
+    onUnpin,
+    onHide,
+    rowOpened,
+    onMarkUnread,
+    onShare,
+    handlePin,
+    handleUnpin,
+    handleHide,
+    handleMarkUnread,
+    handleShare,
+  ]);
+
+  const pinLabel = pinned ? `Unpin ${title}` : `Pin ${title}`;
+  const doneLabel = done ? `Unmark ${title} done` : `Mark ${title} done`;
+  // Wide-viewport-only Done button on feed rows: fills the row's reserved
+  // middle slot with the same toggle the reader's action bar exposes. Library
+  // rows suppress it (the right-side button already names the slot's
+  // intent — Unmark done / Unfavorite / Unhide / Unpin, or Unpin on
+  // /pinned where Pin/Unpin stays the default), and narrow viewports keep
+  // the row's two-tap-zone shape so phones see no change. `rightAction`
+  // also suppresses it as defense-in-depth — any caller deliberately
+  // taking over the right slot would otherwise get a stale Done button.
+  const showDoneButton = !isLibraryRow && !rightAction && wide;
+  const handleToggleDone = useCallback(() => {
+    if (done) unmarkDone(story.id);
+    else markDone(story.id);
+  }, [done, story.id, markDone, unmarkDone]);
+
+  // Per-row keyboard shortcuts: Space opens the row menu, `o` opens
+  // the article in a new tab, `p` toggles pin, `d` dismisses (hides)
+  // the row. Enter falls through to the native <Link> activation.
+  // Navigation (j/k/arrows) and the `?` help overlay are handled at
+  // document scope by useListKeyboardNav / KeyboardShortcutsOverlay.
+  const handleRowKeyDown = useCallback(
+    (e: KeyboardEvent<HTMLAnchorElement>) => {
+      if (e.defaultPrevented) return;
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      switch (e.key) {
+        case ' ':
+        case 'Spacebar': {
+          if (menuItems.length > 0) {
+            e.preventDefault();
+            openMenu();
+          }
+          break;
+        }
+        case 'o': {
+          // Mirror Thread's "Read article" link: gate on the same
+          // http(s) allowlist so an HN URL with a `javascript:`/`data:`
+          // scheme can't reach `window.open`, and record the
+          // article-open so the row picks up its "opened" treatment
+          // and shows up in `/opened` just like the click path.
+          const url = story.url;
+          if (isSafeHttpUrl(url)) {
+            e.preventDefault();
+            markArticleOpenedId(story.id);
+            window.open(url, '_blank', 'noopener,noreferrer');
+          }
+          break;
+        }
+        case 'p': {
+          if (onPin || onUnpin) {
+            e.preventDefault();
+            handleTogglePin();
+          }
+          break;
+        }
+        case 'd': {
+          if (onHide && !pinned) {
+            e.preventDefault();
+            // Capture the focused row's index in the document-wide
+            // list, then re-query after the hide commits so we focus
+            // whatever moved into the slot the hidden row vacated.
+            const rows = Array.from(
+              document.querySelectorAll<HTMLElement>('.story-row__body'),
+            );
+            const idx = rows.indexOf(e.currentTarget);
+            handleHide();
+            requestAnimationFrame(() => {
+              const next = Array.from(
+                document.querySelectorAll<HTMLElement>('.story-row__body'),
+              );
+              if (next.length === 0) return;
+              const at = idx < 0 ? 0 : Math.min(idx, next.length - 1);
+              next[at]?.focus();
+            });
+          }
+          break;
+        }
+      }
+    },
+    [
+      menuItems.length,
+      openMenu,
+      story.id,
+      story.url,
+      onPin,
+      onUnpin,
+      handleTogglePin,
+      onHide,
+      pinned,
+      handleHide,
+    ],
+  );
+
+  // Swipe-reveal hints, shown behind the row. Each edge labels the
+  // outcome of a swipe that reveals *that* edge: shield text when
+  // the row's state blocks the gesture, action text when the
+  // gesture commits. Static layout, revealed by the row's own
+  // translate3d at rest vs. mid-swipe. See SPEC.md under *Pinned
+  // vs. Favorite vs. Done*.
+  //
+  //   left edge  (revealed when finger pushes right):
+  //     pinned      → "Pinned" (shield — swipe-right blocked)
+  //     has onHide  → "Hide"   (action — swipe-right will hide)
+  //   right edge (revealed when finger pushes left):
+  //     hidden      → "Hidden" (shield — swipe-left blocked)
+  //     pinned      → "Pinned" (shield — swipe-left also blocked,
+  //                             both directions on a pinned row
+  //                             rubber-band identically)
+  //     has onPin   → "Pin"    (action — swipe-left will pin)
+  const leftHint = pinned
+    ? { label: 'Pinned', testId: 'swipe-hint-pinned-left' }
+    : onHide
+    ? { label: 'Hide', testId: 'swipe-hint-hide' }
+    : null;
+  const rightHint = hidden
+    ? { label: 'Hidden', testId: 'swipe-hint-hidden' }
+    : pinned
+    ? { label: 'Pinned', testId: 'swipe-hint-pinned-right' }
+    : onPin
+    ? { label: 'Pin', testId: 'swipe-hint-pin' }
+    : null;
+
+  return (
+    <>
+      {leftHint ? (
+        <span
+          className="story-row__swipe-hint story-row__swipe-hint--left"
+          data-testid={leftHint.testId}
+          aria-hidden="true"
+        >
+          {leftHint.label}
+        </span>
+      ) : null}
+      {rightHint ? (
+        <span
+          className="story-row__swipe-hint story-row__swipe-hint--right"
+          data-testid={rightHint.testId}
+          aria-hidden="true"
+        >
+          {rightHint.label}
+        </span>
+      ) : null}
+      <article
+        ref={articleRef}
+        className={rowClass}
+        data-testid="story-row"
+        style={style}
+        {...handlers}
+        onContextMenu={handleContextMenu}
+      >
+      <Link
+        to={`/item/${story.id}`}
+        className="story-row__body story-row__body--stretched"
+        data-testid="story-title"
+        onClick={handleOpenThread}
+        onKeyDown={handleRowKeyDown}
+      >
+        <span className="story-row__title-text">{title}</span>
+        <span className="story-row__meta" data-testid="story-meta">
+          {domainLabel ? `${domainLabel} · ` : ''}
+          {formatStoryMetaTail({ ...story, newCommentCount }, undefined, {
+            showVelocity,
+          })}
+          {flagText ? (
+            <>
+              {' · '}
+              <span className="story-row__hot" data-testid="story-hot">
+                {flagText}
+              </span>
+            </>
+          ) : null}
+        </span>
+      </Link>
+
+      {showDoneButton ? (
+        <TooltipButton
+          type="button"
+          className={'pin-btn' + (done ? ' pin-btn--active' : '')}
+          data-testid="done-btn"
+          aria-pressed={done}
+          aria-label={doneLabel}
+          tooltip={done ? 'Unmark done' : 'Mark done'}
+          onClick={handleToggleDone}
+        >
+          <svg
+            className="pin-btn__icon"
+            viewBox="0 -960 960 960"
+            width="22"
+            height="22"
+            fill="currentColor"
+            aria-hidden="true"
+            focusable="false"
+          >
+            {/* Material Symbols done / check_circle — Apache 2.0, Google. */}
+            {done ? (
+              <path d="M480-80q-83 0-156-31.5T197-197q-54-54-85.5-127T80-480q0-83 31.5-156T197-763q54-54 127-85.5T480-880q83 0 156 31.5T763-763q54 54 85.5 127T880-480q0 83-31.5 156T763-197q-54 54-127 85.5T480-80Zm-56-216 280-280-56-56-224 224-114-114-56 56 170 170Z" />
+            ) : (
+              <path d="M382-240 154-468l57-57 171 171 367-367 57 57-424 424Z" />
+            )}
+          </svg>
+        </TooltipButton>
+      ) : null}
+
+      {rightAction ? (
+        <TooltipButton
+          type="button"
+          className={
+            'pin-btn' + (rightAction.active === false ? '' : ' pin-btn--active')
+          }
+          data-testid={rightAction.testId ?? 'row-action-btn'}
+          aria-label={rightAction.label}
+          tooltip={rightAction.label}
+          onClick={rightAction.onToggle}
+        >
+          <span className="pin-btn__icon">{rightAction.icon}</span>
+        </TooltipButton>
+      ) : (
+        <TooltipButton
+          type="button"
+          className={'pin-btn' + (pinned ? ' pin-btn--active' : '')}
+          data-testid="pin-btn"
+          aria-pressed={pinned}
+          aria-label={pinLabel}
+          tooltip={pinned ? 'Unpin' : 'Pin'}
+          onClick={handleTogglePin}
+        >
+          <svg
+            className="pin-btn__icon"
+            viewBox="0 0 24 24"
+            width="22"
+            height="22"
+            fill="currentColor"
+            aria-hidden="true"
+            focusable="false"
+          >
+            {/* Material Icons push_pin — Apache 2.0, Google. */}
+            {pinned ? (
+              <path d="M16 9V4l1 0c.55 0 1-.45 1-1s-.45-1-1-1H7c-.55 0-1 .45-1 1s.45 1 1 1l1 0v5c0 1.66-1.34 3-3 3v2h5.97v7l1 1 1-1v-7H19v-2c-1.66 0-3-1.34-3-3z" />
+            ) : (
+              <path d="M14 4v5c0 1.12.37 2.16 1 3H9c.65-.86 1-1.9 1-3V4h4m3-2H7c-.55 0-1 .45-1 1s.45 1 1 1l1 0v5c0 1.66-1.34 3-3 3v2h5.97v7l1 1 1-1v-7H19v-2c-1.66 0-3-1.34-3-3V4l1 0c.55 0 1-.45 1-1s-.45-1-1-1z" />
+            )}
+          </svg>
+        </TooltipButton>
+      )}
+
+      {menuItems.length > 0 ? (
+        <StoryRowMenu
+          open={menuOpen}
+          title={title}
+          items={menuItems}
+          anchorEl={menuAnchor}
+          onClose={closeMenu}
+        />
+      ) : null}
+      </article>
+    </>
+  );
+}

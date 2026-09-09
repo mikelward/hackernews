@@ -1,0 +1,454 @@
+.comment {
+  /* Asymmetric vertical padding on purpose. The top edge sits
+     directly above body text and reads best with a comfortable 8px
+     gap. The bottom edge sits below the footer row, whose toggle and
+     toolbar buttons each carry 8px of internal vertical padding inside
+     a 36px band — that internal padding already provides visual
+     breathing room below the icons, so a smaller card padding-bottom
+     keeps the bottom from reading heavier than the top. Symmetric 8/8
+     made the bottom feel weighted. The band, not this padding, is the
+     dominant term: see its sizing below for what it cost at 44px.
+     The padding-bottom value comes from --comment-stack-gap so it
+     stays locked to .comment__children's margin-top below — see
+     global.css for the pairing rationale. */
+  padding: 8px var(--comment-gutter) var(--comment-stack-gap);
+  border-top: 1px solid var(--nh-border);
+  background: var(--nh-bg-card);
+  color: var(--nh-text);
+  cursor: pointer;
+  box-shadow: inset 3px 0 0 0 var(--nh-border);
+}
+
+.comment.is-expanded {
+  box-shadow: inset 3px 0 0 0 var(--nh-orange);
+  cursor: default;
+}
+
+/* Keyboard-focus marker — set by useThreadKeyboardNav after every
+   j/k/Enter so the reader can see which card Enter will toggle.
+   Layered on top of the collapsed/expanded left stripe via stacked
+   inset box-shadows; no layout shift. Driven by a data attribute
+   rather than a class so React's expand/collapse re-render doesn't
+   clobber it (className would be reconciled away on the next
+   render — see KEYBOARD_FOCUS_ATTR in useThreadKeyboardNav.ts). */
+.comment[data-keyboard-focused] {
+  box-shadow:
+    inset 0 3px 0 0 var(--nh-orange),
+    inset 3px 0 0 0 var(--nh-border);
+}
+
+.comment[data-keyboard-focused].is-expanded {
+  box-shadow:
+    inset 0 3px 0 0 var(--nh-orange),
+    inset 3px 0 0 0 var(--nh-orange);
+}
+
+/* Bottom action row of the card: meta comes first and flexes to
+   fill the left side, the optional toolbar (upvote/downvote/reply,
+   expanded only) sits to the right of the meta, and the expand/
+   collapse toggle is pinned to the far right. The four icons (three
+   in the toolbar plus the toggle) are grouped in the right-hand
+   corner, with an 8px gap between the toolbar and the toggle so the
+   collapse reads as a distinct control rather than a fourth action.
+   The toggle stays at the bottom of the .comment block, so when the
+   comment expands and the body un-clamps + children render below,
+   the button visually moves down with the growing card. */
+.comment__footer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-left: 1px;
+  font-size: 0.8125rem;
+  color: var(--nh-meta);
+}
+
+.comment__meta {
+  flex: 1 1 auto;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.comment__author {
+  color: inherit;
+  font-weight: 600;
+  text-decoration: none;
+  padding: 4px 2px;
+}
+
+@media (hover: hover) {
+  .comment__author:hover {
+    text-decoration: underline;
+  }
+}
+
+.comment__body {
+  font-size: 0.9375rem;
+  line-height: 1.5;
+  color: var(--nh-text);
+  word-wrap: break-word;
+}
+
+.comment__body--clamped {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  /* `-webkit-line-clamp` only counts inline line boxes, so a collapsed
+     comment whose body is a block-level `<pre>`/`<code>` block (or any
+     other block child) slips past the 3-line clamp and dumps its whole
+     contents into the preview. The max-height caps the preview at the
+     same 3 lines (line-height 1.5 × 3) regardless of what kind of
+     content is inside, so code-block comments collapse like text ones. */
+  max-height: calc(1.5em * 3);
+}
+
+.comment__body a {
+  color: var(--nh-orange);
+  text-decoration: underline;
+}
+
+.comment__body pre {
+  overflow-x: auto;
+  background: var(--nh-bg-code);
+  padding: 8px;
+  border-radius: 4px;
+}
+
+.comment__body p {
+  margin: 0 0 8px;
+}
+
+.comment__body p:first-child {
+  margin-top: 0;
+}
+
+.comment__body p:last-child {
+  margin-bottom: 0;
+}
+
+/* In the collapsed preview, drop the 8px inter-paragraph gap that
+   `.comment__body p` adds. Otherwise a plain-text comment with
+   paragraph breaks spends part of the 3-line `max-height` cap on
+   margins and gets clipped to ~2 lines, short of the documented
+   3-line preview. The gap is restored when the comment expands.
+   Declared after `.comment__body p` so it wins the same-specificity
+   tie on source order. */
+.comment__body--clamped p {
+  margin-bottom: 0;
+}
+
+/* Thin borderless action toolbar on the right side of the footer
+   row, between the flex-filling meta and the far-right toggle.
+   Present only when the comment is expanded. Borderless on purpose
+   — the strip reads as a single toolbar rather than a row of
+   separate controls. */
+.comment__toolbar {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 0;
+  flex-shrink: 0;
+}
+
+.comment__toolbar-button {
+  /* Positioned for the ::after that carries the touch hit area below. */
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 44px;
+  padding: 8px 12px;
+  border: 0;
+  background: transparent;
+  color: var(--nh-meta);
+  cursor: pointer;
+  border-radius: 4px;
+  text-decoration: none;
+  font: inherit;
+}
+
+@media (hover: hover) {
+  .comment__toolbar-button:hover {
+    color: var(--nh-text);
+    background: var(--nh-pressed);
+    text-decoration: none;
+  }
+}
+
+.comment__toolbar-button:active {
+  background: var(--nh-border);
+}
+
+.comment__toolbar-button:focus-visible {
+  outline: 2px solid var(--nh-orange);
+  outline-offset: -2px;
+}
+
+/* Voted state — matches HN's own shape+color convention (the arrow
+   stays solid, only the color flips to --nh-orange) and the story
+   vote button in ThreadActionBar. Pinned to aria-pressed="true" so
+   the ARIA state and the visual state can't drift. */
+.comment__toolbar-button--active,
+.comment__toolbar-button[aria-pressed='true'] {
+  color: var(--nh-orange);
+}
+
+@media (hover: hover) {
+  .comment__toolbar-button--active:hover,
+  .comment__toolbar-button[aria-pressed='true']:hover {
+    /* Keep the orange on hover so unvoting still reads as a reversal
+       of the current state rather than turning white first. */
+    color: var(--nh-orange);
+    background: var(--nh-pressed);
+  }
+}
+
+/* Disabled (currently: Downvote placeholder). Muted color + no
+   interactive feedback so it reads as "not yet available" rather
+   than "broken". Matches the `:disabled` attribute AND the explicit
+   `aria-disabled` string since TooltipButton forwards both. */
+.comment__toolbar-button:disabled,
+.comment__toolbar-button[aria-disabled='true'] {
+  color: var(--nh-border);
+  cursor: default;
+}
+
+@media (hover: hover) {
+  .comment__toolbar-button:disabled:hover,
+  .comment__toolbar-button[aria-disabled='true']:hover {
+    color: var(--nh-border);
+    background: transparent;
+  }
+}
+
+.comment__toolbar-button:disabled:active,
+.comment__toolbar-button[aria-disabled='true']:active {
+  background: transparent;
+}
+
+/* Expand/collapse button at the bottom-right of the card. Same shape as the
+   toolbar buttons — the band sizing below covers both — so the four icons on
+   an expanded card read as one consistent action row. */
+.comment__toggle {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 44px;
+  padding: 8px 12px;
+  border: 0;
+  background: transparent;
+  color: var(--nh-meta);
+  cursor: pointer;
+  border-radius: 4px;
+  flex-shrink: 0;
+  /* Pin to the right edge regardless of whether the toolbar is
+     present (expanded) or absent (collapsed). With `flex: 1` on
+     .comment__meta this is technically redundant, but stating the
+     intent here keeps the layout robust if the meta is ever empty
+     (e.g. a comment with no author and no age). */
+  margin-left: auto;
+}
+
+/* The footer band is 36px tall on every device, and on touch a pseudo-element
+   puts the missing 8px back as hit area rather than as paint.
+
+   The band is what sets the card's vertical rhythm: its height comes from these
+   buttons, not from the 13px meta text sitting in them, so a 44px band left
+   13px of empty button under the toggle glyph and the card's own 4px on top of
+   that — 17px below a collapsed comment's last ink against 11.75px above its
+   first. Painting 36px brings that to 12px, near enough to symmetric.
+
+   Sizing the paint and sizing the target are separate questions, and only the
+   second one has a floor (maintainer, 2026-09-03: "the intention was hit
+   area"). So nothing is traded away here — the touch target is still a full
+   44x44, it is just no longer the same rectangle as the ink. */
+.comment__toolbar-button,
+.comment__toggle {
+  /* An explicit size, not just a floor. These glyphs ship at 22px (toolbar)
+     and 18px (toggle), so `min-height` alone left the buttons at their
+     intrinsic 22 + 8 + 8 = 38px — a floor can only raise a box, never shrink
+     one. */
+  height: 36px;
+  min-height: 36px;
+}
+
+/* And the glyph is sized to match, for the reason `.thread__action--icon`
+   gives: 8px each side leaves a 20px content box, and the global
+   `svg { max-width: 100% }` would otherwise squeeze a 22px glyph's width to
+   20 while its height stayed 22. */
+.comment__toolbar-button svg,
+.comment__toggle svg {
+  width: 20px;
+  height: 20px;
+}
+
+/* The touch hit area: 4px above and below restores the 44px height the paint
+   gave up, leaving a 44x44 target (the width is untouched — `min-width: 44px`
+   already holds it, and widening it here would eat into the 2px between
+   neighboring toolbar buttons, which are three *different* actions).
+
+   Vertical only, so it grows into the card's own bottom padding and the body's
+   bottom half-leading and reaches neither the card below nor the one above. */
+.comment__toolbar-button::after,
+.comment__toggle::after {
+  content: '';
+  position: absolute;
+  inset: -4px 0;
+}
+
+@media (hover: hover) {
+  /* A cursor is precise, so the target is the paint. This is also what keeps
+     the expanded area from swallowing hover 4px outside the button. */
+  .comment__toolbar-button::after,
+  .comment__toggle::after {
+    content: none;
+  }
+
+  /* Freed from the touch floor, the width closes to the square the thread
+     action bar uses at this size (SPEC *Thread action bar*). */
+  .comment__toolbar-button,
+  .comment__toggle {
+    width: 36px;
+    min-width: 36px;
+    padding: 8px;
+  }
+}
+
+@media (hover: hover) {
+  .comment__toggle:hover {
+    color: var(--nh-text);
+    background: var(--nh-pressed);
+  }
+}
+
+.comment__toggle:active {
+  background: var(--nh-border);
+}
+
+.comment__toggle:focus-visible {
+  outline: 2px solid var(--nh-orange);
+  outline-offset: -2px;
+}
+
+.comment__toggle-icon {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.comment__toggle-icon svg {
+  display: block;
+}
+
+.comment__children {
+  /* --comment-stack-gap matches .comment's padding-bottom: the
+     parent's padding-bottom only takes effect after all children, so
+     this margin-top is what sets the gap before the first nested
+     reply's border. Sharing the token keeps parent → first-child and
+     sibling → sibling gaps identical.
+
+     The horizontal margin is deliberately asymmetric:
+       - LEFT stays at 0, so the nested list sits inside the parent's
+         --comment-gutter left padding. That left indent is the visual
+         cue for reply depth — a reader sees nesting through the
+         stacked left edge, not just the left stripe.
+       - RIGHT is negative --comment-gutter, pulling the nested list
+         out of the parent's right padding so a nested reply's right
+         edge reaches the thread's right edge. Otherwise each level
+         of nesting would shrink the reading column by another gutter
+         on the right, which compounds into a lopsided margin that
+         has nothing to do with depth. Right-gutter width is the same
+         for every comment, top-level or nested. */
+  margin: var(--comment-stack-gap) calc(var(--comment-gutter) * -1) 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.comment--loading .comment__footer {
+  opacity: 0.6;
+}
+
+/* Failed-to-load card: same footprint as the loading card, but with a
+   readable message and a Retry button so the reader isn't stuck staring
+   at a perpetual "…" when the HN API has a bad night. */
+.comment--error {
+  cursor: default;
+}
+
+.comment__error-text {
+  color: var(--nh-meta);
+}
+
+.comment__retry {
+  min-width: 44px;
+  min-height: 44px;
+  padding: 10px 12px;
+  border: 1px solid var(--nh-border);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--nh-text);
+  font: inherit;
+  /* Action control — stays px so the Text size setting doesn't scale it. */
+  font-size: 13px;
+  cursor: pointer;
+  flex-shrink: 0;
+  margin-left: auto;
+}
+
+@media (hover: hover) {
+  .comment__retry:hover {
+    background: var(--nh-pressed);
+  }
+}
+
+.comment__retry:active {
+  background: var(--nh-border);
+}
+
+.comment__retry:focus-visible {
+  outline: 2px solid var(--nh-orange);
+  outline-offset: -2px;
+}
+
+/* Reserved-height stand-in for an unloaded top-level comment. min-height
+   tracks a typical collapsed comment (clamped body + 36px footer) so the
+   thread's scroll height is set up front and the real card swapping in
+   only nudges layout below the fold rather than appending at the bottom.
+   Non-interactive — it's a skeleton, not a card the reader can toggle.
+
+   Down 8px with the band: this was 100px against a 44px footer, and a
+   figure calibrated on the old geometry would now over-reserve on every
+   unloaded card — which is the reflow it exists to avoid, in the other
+   direction. */
+.comment--placeholder {
+  cursor: default;
+  min-height: 92px;
+}
+
+.comment__placeholder-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 4px 0 6px;
+}
+
+.comment__placeholder-line,
+.comment__placeholder-meta {
+  height: 12px;
+  border-radius: 4px;
+  background: var(--nh-border);
+  opacity: 0.6;
+}
+
+.comment__placeholder-line:last-child {
+  width: 55%;
+}
+
+.comment__placeholder-meta {
+  display: inline-block;
+  width: 80px;
+}

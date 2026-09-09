@@ -1,0 +1,205 @@
+.story-row {
+  position: relative;
+  /* Opaque so it covers the shield-hint labels (siblings of the row)
+     when the row is at rest. The list-item <li> supplies the same
+     card color; this duplication is intentional so the row can still
+     paint on top of the hints when it translates over them. */
+  background: var(--nh-bg-card);
+  z-index: 1;
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+  /* No VERTICAL padding here, deliberately. `.pin-btn` is a flex child with
+     `min-height: var(--tap-min)`, so it already forces this row's content box
+     to 48px — and any vertical padding stacks on top of that, which is what
+     pinned every row to 60px however small the text got. Breathing room lives
+     on `.story-row__body` instead, inside the 48px rather than added to it.
+     The floor is stated here too: the stretched `::after` (inset: 0) makes the
+     whole row the link's hit area, so the row is what has to clear 48px. */
+  padding: 0 12px;
+  min-height: var(--tap-min);
+  touch-action: pan-y;
+  -webkit-touch-callout: none;
+}
+
+/* Swipe-reveal hints. Rendered as siblings of `.story-row` inside
+   each `.story-list__item`, anchored to the left/right edge. Hidden
+   behind the opaque row at rest; revealed as the row translates
+   under a swipe. Each edge labels the outcome of a swipe in that
+   direction — "Pinned"/"Hidden" (shield: gesture blocked) or
+   "Pin"/"Hide" (action: gesture will run). One visual style for
+   both; the word carries the meaning. See SPEC.md under *Pinned
+   vs. Favorite vs. Done*. */
+.story-row__swipe-hint {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  display: flex;
+  align-items: center;
+  padding: 0 20px;
+  color: var(--nh-meta);
+  font-size: 0.8125rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  pointer-events: none;
+  z-index: 0;
+}
+
+.story-row__swipe-hint--left {
+  left: 0;
+}
+
+.story-row__swipe-hint--right {
+  right: 0;
+}
+
+.story-row--dragging {
+  user-select: none;
+  -webkit-user-select: none;
+  cursor: grabbing;
+}
+
+.story-row__body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  color: var(--nh-text);
+  text-decoration: none;
+  /* The row's former 6px, moved here. Same optical inset above the title and
+     below the meta, and the same room for the pressed/hover highlight — but
+     inside the 48px tap floor rather than stacked on top of it, so the row is
+     free to shrink toward that floor as the text gets smaller. */
+  padding: 6px 0;
+  border-radius: 6px;
+}
+
+.story-row__body--stretched::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+}
+
+.story-row__body:visited {
+  color: var(--nh-read);
+}
+
+.story-row--opened .story-row__body,
+.story-row--opened .story-row__title-text {
+  color: var(--nh-read);
+  font-weight: 400;
+}
+
+.story-row--opened .story-row__meta {
+  color: var(--nh-meta);
+  font-weight: 400;
+}
+
+@media (hover: hover) {
+  /* Row-wide hover tint on pointer devices so the whole row (body
+     and pin-button column alike) signals that it's interactive. The
+     body still carries its own matching hover rule for the "the
+     link is directly targeted" case. */
+  .story-row:hover {
+    background: var(--nh-pressed);
+  }
+  .story-row__body:hover {
+    text-decoration: none;
+    background: var(--nh-pressed);
+  }
+}
+
+.story-row__body:active {
+  background: var(--nh-border);
+}
+
+/* Keyboard-navigated active row. Mirrors the thread keyboard-focus
+   marker (`.comment[data-keyboard-focused]` in Comment.css): a solid,
+   straight 3px brand-orange line flush with the row's top edge, so
+   the same "this is the row the keys act on" cue reads consistently
+   between list pages and thread pages. The shadow lives on the outer
+   `.story-row` (not the inner `<a>`) so it sits behind the body's
+   padding and is the full width of the row. `:has(:focus-visible)`
+   keeps the indicator out of click-focus territory — mouse clicks
+   never leave it stuck on a row. The default browser focus ring on
+   the inner link is suppressed since the top bar is doing the same
+   job. */
+.story-row:has(.story-row__body:focus-visible) {
+  background: var(--nh-pressed);
+  box-shadow: inset 0 3px 0 var(--nh-orange);
+}
+.story-row__body:focus-visible {
+  outline: none;
+}
+
+.story-row__title-text {
+  display: block;
+  font-size: 1rem;
+  font-weight: 500;
+  line-height: 1.3;
+  word-wrap: break-word;
+}
+
+.story-row__meta {
+  display: block;
+  color: var(--nh-meta);
+  /* 13px matches the thread and comment meta. Left padding nudges the
+     meta's lowercase/digit first glyph (e.g. "c" in a domain, "4" in
+     a point count) into optical alignment with the title's bolder
+     uppercase first glyph above, which carries slightly more inset. */
+  font-size: 0.8125rem;
+  line-height: 1.3;
+  margin-top: 4px;
+  padding-left: 1px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Trending flag: orange "hot" text appended to the meta line. Same
+   font-size as the rest of the meta; color alone carries the signal. */
+.story-row__hot {
+  color: var(--nh-orange);
+  font-weight: 600;
+}
+
+.pin-btn {
+  position: relative;
+  z-index: 2;
+  flex-shrink: 0;
+  align-self: stretch;
+  min-width: var(--tap-min);
+  min-height: var(--tap-min);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 8px;
+  border: none;
+  background: transparent;
+  color: var(--nh-meta);
+  cursor: pointer;
+  border-radius: 8px;
+  margin-left: 4px;
+}
+
+@media (hover: hover) {
+  .pin-btn:hover {
+    background: var(--nh-pressed);
+    color: var(--nh-orange);
+  }
+}
+
+.pin-btn:active {
+  background: var(--nh-border);
+}
+
+.pin-btn--active {
+  color: var(--nh-orange);
+}
+
+.pin-btn__icon {
+  display: block;
+}

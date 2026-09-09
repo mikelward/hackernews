@@ -1,0 +1,710 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { act, fireEvent, render, screen } from '@testing-library/react';
+import { TooltipButton } from './TooltipButton';
+import { cancelPointerGestures } from '../lib/gestureCancel';
+
+// jsdom ships no real PointerEvent constructor, so Testing Library's
+// `fireEvent.pointerEnter/Leave` fall back to a plain Event and drop the
+// `pointerType` from the init dict — which the hover path keys off. Give
+// it a minimal PointerEvent that carries pointerType through so the
+// mouse-hover tests exercise the real branch.
+if (typeof window.PointerEvent === 'undefined') {
+  class PointerEventPolyfill extends MouseEvent {
+    pointerType: string;
+    pointerId: number;
+    constructor(type: string, params: PointerEventInit = {}) {
+      super(type, params);
+      this.pointerType = params.pointerType ?? '';
+      this.pointerId = params.pointerId ?? 0;
+    }
+  }
+  // @ts-expect-error — assigning the polyfill to the global.
+  window.PointerEvent = PointerEventPolyfill;
+}
+
+type PointerType = 'touch' | 'pen' | 'mouse';
+
+function dispatch(
+  target: Element,
+  type: 'pointerdown' | 'pointermove' | 'pointerup' | 'pointercancel',
+  opts: {
+    clientX?: number;
+    clientY?: number;
+    pointerId?: number;
+    pointerType?: PointerType;
+  } = {},
+) {
+  const evt = new Event(type, { bubbles: true, cancelable: true });
+  Object.assign(evt, {
+    pointerId: opts.pointerId ?? 1,
+    pointerType: opts.pointerType ?? 'touch',
+    clientX: opts.clientX ?? 0,
+    clientY: opts.clientY ?? 0,
+    button: 0,
+    isPrimary: true,
+  });
+  act(() => {
+    target.dispatchEvent(evt);
+  });
+  return evt;
+}
+
+function mockRect(el: Element, rect: Partial<DOMRect>) {
+  const defaults = {
+    x: 0,
+    y: 0,
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    width: 0,
+    height: 0,
+    toJSON() {},
+  };
+  const full: DOMRect = { ...defaults, ...rect } as DOMRect;
+  const original = el.getBoundingClientRect;
+  el.getBoundingClientRect = () => full;
+  return () => {
+    el.getBoundingClientRect = original;
+  };
+}
+
+describe('TooltipButton', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('renders the button with children and passes through native props', () => {
+    render(
+      <TooltipButton
+        tooltip="Pin"
+        aria-label="Pin story"
+        data-testid="btn"
+        disabled
+      >
+        <span>icon</span>
+      </TooltipButton>,
+    );
+    const btn = screen.getByTestId('btn');
+    expect(btn.tagName).toBe('BUTTON');
+    expect(btn).toHaveAttribute('aria-label', 'Pin story');
+    // `disabled` is rendered as a soft disable (aria-disabled), not the native
+    // attribute, so the control still receives events and can show its tooltip.
+    expect(btn).toHaveAttribute('aria-disabled', 'true');
+    expect(btn).not.toBeDisabled();
+    expect(btn).toHaveTextContent('icon');
+  });
+
+  it('omits a native title by default so our styled tooltip does not double up with the browser tooltip on hover', () => {
+    render(
+      <TooltipButton tooltip="Dismiss unpinned" data-testid="btn">
+        x
+      </TooltipButton>,
+    );
+    expect(screen.getByTestId('btn')).not.toHaveAttribute('title');
+  });
+
+  it('lets the consumer pass an explicit title through when they need one', () => {
+    render(
+      <TooltipButton tooltip="Pin" title="Pin (custom)" data-testid="btn">
+        x
+      </TooltipButton>,
+    );
+    expect(screen.getByTestId('btn')).toHaveAttribute('title', 'Pin (custom)');
+  });
+
+  it('shows the tooltip on mouse hover after the delay', () => {
+    render(
+      <TooltipButton tooltip="Refresh" data-testid="btn">
+        x
+      </TooltipButton>,
+    );
+    const btn = screen.getByTestId('btn');
+    const restore = mockRect(btn, {
+      top: 12,
+      left: 40,
+      width: 48,
+      height: 48,
+      right: 88,
+      bottom: 60,
+    });
+    act(() => {
+      fireEvent.pointerEnter(btn, { pointerType: 'mouse', pointerId: 1 });
+    });
+    expect(screen.queryByRole('tooltip')).toBeNull();
+    act(() => {
+      vi.advanceTimersByTime(500);
+    });
+    expect(screen.getByRole('tooltip')).toHaveTextContent('Refresh');
+    restore();
+  });
+
+  it('hides the hover tooltip on mouse leave', () => {
+    render(
+      <TooltipButton tooltip="Refresh" data-testid="btn">
+        x
+      </TooltipButton>,
+    );
+    const btn = screen.getByTestId('btn');
+    const restore = mockRect(btn, {
+      top: 12,
+      left: 40,
+      width: 48,
+      height: 48,
+      right: 88,
+      bottom: 60,
+    });
+    act(() => {
+      fireEvent.pointerEnter(btn, { pointerType: 'mouse', pointerId: 1 });
+    });
+    act(() => {
+      vi.advanceTimersByTime(500);
+    });
+    expect(screen.getByRole('tooltip')).toBeInTheDocument();
+    act(() => {
+      fireEvent.pointerLeave(btn, { pointerType: 'mouse', pointerId: 1 });
+    });
+    expect(screen.queryByRole('tooltip')).toBeNull();
+    restore();
+  });
+
+  it('does NOT auto-hide the hover tooltip on a timer', () => {
+    render(
+      <TooltipButton tooltip="Refresh" data-testid="btn" tooltipDurationMs={300}>
+        x
+      </TooltipButton>,
+    );
+    const btn = screen.getByTestId('btn');
+    const restore = mockRect(btn, {
+      top: 12,
+      left: 40,
+      width: 48,
+      height: 48,
+      right: 88,
+      bottom: 60,
+    });
+    act(() => {
+      fireEvent.pointerEnter(btn, { pointerType: 'mouse', pointerId: 1 });
+    });
+    act(() => {
+      vi.advanceTimersByTime(500);
+    });
+    expect(screen.getByRole('tooltip')).toBeInTheDocument();
+    act(() => {
+      vi.advanceTimersByTime(5000);
+    });
+    // Still up — hover tooltips persist until the pointer leaves.
+    expect(screen.getByRole('tooltip')).toBeInTheDocument();
+    restore();
+  });
+
+  it('does NOT fire the hover tooltip from a pointerdown on a mouse', () => {
+    render(
+      <TooltipButton tooltip="Pin" data-testid="btn">
+        x
+      </TooltipButton>,
+    );
+    const btn = screen.getByTestId('btn');
+    dispatch(btn, 'pointerdown', { pointerType: 'mouse' });
+    act(() => {
+      vi.advanceTimersByTime(2000);
+    });
+    expect(screen.queryByRole('tooltip')).toBeNull();
+  });
+
+  it('shows the tooltip on keyboard focus (:focus-visible), and hides on blur', () => {
+    render(
+      <TooltipButton tooltip="Refresh" data-testid="btn">
+        x
+      </TooltipButton>,
+    );
+    const btn = screen.getByTestId('btn') as HTMLButtonElement;
+    const restore = mockRect(btn, {
+      top: 12,
+      left: 40,
+      width: 48,
+      height: 48,
+      right: 88,
+      bottom: 60,
+    });
+    // Force :focus-visible to match so the focus path fires (jsdom
+    // is conservative about :focus-visible heuristics).
+    const originalMatches = btn.matches;
+    // `Element.matches` is an overload set whose tag-name overloads are type
+    // predicates (`this is HTMLAnchorElement` and friends). A selector stub
+    // can't narrow `this`, so the assignment needs the cast; the plain
+    // `(selectors: string) => boolean` overload is the one under test.
+    btn.matches = ((sel: string) =>
+      sel === ':focus-visible'
+        ? true
+        : originalMatches.call(btn, sel)) as typeof btn.matches;
+    try {
+      act(() => {
+        btn.focus();
+        fireEvent.focus(btn);
+      });
+      act(() => {
+        vi.advanceTimersByTime(500);
+      });
+      expect(screen.getByRole('tooltip')).toHaveTextContent('Refresh');
+      act(() => {
+        fireEvent.blur(btn);
+      });
+      expect(screen.queryByRole('tooltip')).toBeNull();
+    } finally {
+      btn.matches = originalMatches;
+      restore();
+    }
+  });
+
+  it('does NOT show the tooltip on focus that is not :focus-visible (mouse-click focus)', () => {
+    render(
+      <TooltipButton tooltip="Pin" data-testid="btn">
+        x
+      </TooltipButton>,
+    );
+    const btn = screen.getByTestId('btn') as HTMLButtonElement;
+    const originalMatches = btn.matches;
+    // See the cast note on the :focus-visible-matches test above.
+    btn.matches = ((sel: string) =>
+      sel === ':focus-visible'
+        ? false
+        : originalMatches.call(btn, sel)) as typeof btn.matches;
+    try {
+      act(() => {
+        btn.focus();
+        fireEvent.focus(btn);
+      });
+      act(() => {
+        vi.advanceTimersByTime(2000);
+      });
+      expect(screen.queryByRole('tooltip')).toBeNull();
+    } finally {
+      btn.matches = originalMatches;
+    }
+  });
+
+  it('does NOT show the tooltip on a short touch tap', () => {
+    const onClick = vi.fn();
+    render(
+      <TooltipButton tooltip="Pin" data-testid="btn" onClick={onClick}>
+        x
+      </TooltipButton>,
+    );
+    const btn = screen.getByTestId('btn');
+    dispatch(btn, 'pointerdown', { pointerType: 'touch' });
+    act(() => {
+      vi.advanceTimersByTime(100);
+    });
+    dispatch(btn, 'pointerup', { pointerType: 'touch' });
+    act(() => {
+      btn.dispatchEvent(
+        new MouseEvent('click', { bubbles: true, cancelable: true }),
+      );
+    });
+    expect(screen.queryByRole('tooltip')).toBeNull();
+    expect(onClick).toHaveBeenCalledTimes(1);
+  });
+
+  it('shows the tooltip after a 500ms long-press on touch', () => {
+    render(
+      <TooltipButton tooltip="Dismiss unpinned" data-testid="btn">
+        x
+      </TooltipButton>,
+    );
+    const btn = screen.getByTestId('btn');
+    const restore = mockRect(btn, {
+      top: 100,
+      left: 40,
+      width: 48,
+      height: 48,
+      right: 88,
+      bottom: 148,
+    });
+    dispatch(btn, 'pointerdown', { pointerType: 'touch' });
+    act(() => {
+      vi.advanceTimersByTime(500);
+    });
+    const tip = screen.getByRole('tooltip');
+    expect(tip).toHaveTextContent('Dismiss unpinned');
+    // Portaled under document.body so it isn't trapped in narrow parents.
+    expect(tip.parentElement).toBe(document.body);
+    expect(btn).toHaveAttribute('aria-describedby', tip.id);
+    restore();
+  });
+
+  it('tears the long press down when a pinch claims the fingers', () => {
+    // A finger resting on this button is part of the pinch now. The browser
+    // sends no `pointercancel` — the pointer is still down and perfectly
+    // healthy — so without the broadcast the tooltip stays up and its hide
+    // timer keeps running over a gesture that has moved on.
+    render(
+      <TooltipButton tooltip="Pin" data-testid="btn">
+        x
+      </TooltipButton>,
+    );
+    const btn = screen.getByTestId('btn');
+    const restore = mockRect(btn, {
+      top: 100,
+      left: 40,
+      width: 48,
+      height: 48,
+      right: 88,
+      bottom: 148,
+    });
+    dispatch(btn, 'pointerdown', { pointerType: 'touch' });
+    act(() => {
+      vi.advanceTimersByTime(500);
+    });
+    expect(screen.getByRole('tooltip')).toBeInTheDocument();
+
+    act(() => cancelPointerGestures());
+    expect(screen.queryByRole('tooltip')).not.toBeInTheDocument();
+    restore();
+  });
+
+  it('does not activate on the click a pinch-interrupted press leaves behind', () => {
+    // The swallow that covers this lives at the document rather than here,
+    // because the plain `<button>`s this component does not wrap need it just
+    // as much — so what is asserted is the outcome, not where it comes from.
+    const onClick = vi.fn();
+    render(
+      <TooltipButton tooltip="Pin" data-testid="btn" onClick={onClick}>
+        x
+      </TooltipButton>,
+    );
+    const btn = screen.getByTestId('btn');
+
+    dispatch(btn, 'pointerdown', { pointerType: 'touch' });
+    act(() => cancelPointerGestures());
+    fireEvent.click(btn, { detail: 1 });
+
+    expect(onClick).not.toHaveBeenCalled();
+  });
+
+  it('hides the tooltip after the duration elapses', () => {
+    render(
+      <TooltipButton tooltip="Pin" data-testid="btn" tooltipDurationMs={1000}>
+        x
+      </TooltipButton>,
+    );
+    const btn = screen.getByTestId('btn');
+    dispatch(btn, 'pointerdown', { pointerType: 'touch' });
+    act(() => {
+      vi.advanceTimersByTime(500);
+    });
+    expect(screen.getByRole('tooltip')).toBeInTheDocument();
+    act(() => {
+      vi.advanceTimersByTime(1000);
+    });
+    expect(screen.queryByRole('tooltip')).toBeNull();
+  });
+
+  it('cancels the tooltip when the pointer moves beyond the tolerance', () => {
+    render(
+      <TooltipButton tooltip="Pin" data-testid="btn">
+        x
+      </TooltipButton>,
+    );
+    const btn = screen.getByTestId('btn');
+    dispatch(btn, 'pointerdown', {
+      pointerType: 'touch',
+      clientX: 10,
+      clientY: 10,
+    });
+    act(() => {
+      vi.advanceTimersByTime(200);
+    });
+    dispatch(btn, 'pointermove', {
+      pointerType: 'touch',
+      clientX: 60,
+      clientY: 10,
+    });
+    act(() => {
+      vi.advanceTimersByTime(500);
+    });
+    expect(screen.queryByRole('tooltip')).toBeNull();
+  });
+
+  it('cancels the tooltip when the pointer is released before the delay', () => {
+    render(
+      <TooltipButton tooltip="Pin" data-testid="btn">
+        x
+      </TooltipButton>,
+    );
+    const btn = screen.getByTestId('btn');
+    dispatch(btn, 'pointerdown', { pointerType: 'touch' });
+    act(() => {
+      vi.advanceTimersByTime(300);
+    });
+    dispatch(btn, 'pointerup', { pointerType: 'touch' });
+    act(() => {
+      vi.advanceTimersByTime(500);
+    });
+    expect(screen.queryByRole('tooltip')).toBeNull();
+  });
+
+  it('swallows the click that follows a long-press so the action does not fire', () => {
+    const onClick = vi.fn();
+    render(
+      <TooltipButton tooltip="Pin" data-testid="btn" onClick={onClick}>
+        x
+      </TooltipButton>,
+    );
+    const btn = screen.getByTestId('btn');
+    dispatch(btn, 'pointerdown', { pointerType: 'touch' });
+    act(() => {
+      vi.advanceTimersByTime(500);
+    });
+    dispatch(btn, 'pointerup', { pointerType: 'touch' });
+    act(() => {
+      btn.dispatchEvent(
+        // A pointer-driven click carries detail >= 1 (keyboard clicks are 0).
+        new MouseEvent('click', { bubbles: true, cancelable: true, detail: 1 }),
+      );
+    });
+    expect(onClick).not.toHaveBeenCalled();
+  });
+
+  it('does not swallow a keyboard activation after an abandoned long-press', () => {
+    // Regression: a long-press with no click (finger slid off before release)
+    // leaves the latch set until the next POINTERDOWN clears it — but a
+    // keyboard activation (Enter/Space → click with detail === 0) has no
+    // pointerdown, so the first press was silently eaten.
+    const onClick = vi.fn();
+    render(
+      <TooltipButton tooltip="Pin" data-testid="btn" onClick={onClick}>
+        x
+      </TooltipButton>,
+    );
+    const btn = screen.getByTestId('btn');
+    dispatch(btn, 'pointerdown', { pointerType: 'touch' });
+    act(() => {
+      vi.advanceTimersByTime(500);
+    });
+    dispatch(btn, 'pointerup', { pointerType: 'touch' });
+
+    act(() => {
+      btn.dispatchEvent(
+        new MouseEvent('click', { bubbles: true, cancelable: true, detail: 0 }),
+      );
+    });
+    expect(onClick).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not swallow a later mouse click after a long-press with no click', () => {
+    // Regression: a long-press whose click never arrived (finger slid
+    // off before release) left the swallow latch set, and the next
+    // MOUSE click on the button was silently eaten.
+    const onClick = vi.fn();
+    render(
+      <TooltipButton tooltip="Pin" data-testid="btn" onClick={onClick}>
+        x
+      </TooltipButton>,
+    );
+    const btn = screen.getByTestId('btn');
+    // Long-press fires, but no click follows.
+    dispatch(btn, 'pointerdown', { pointerType: 'touch' });
+    act(() => {
+      vi.advanceTimersByTime(500);
+    });
+    dispatch(btn, 'pointerup', { pointerType: 'touch' });
+
+    // Next gesture is a plain mouse click.
+    dispatch(btn, 'pointerdown', { pointerType: 'mouse' });
+    dispatch(btn, 'pointerup', { pointerType: 'mouse' });
+    act(() => {
+      btn.dispatchEvent(
+        new MouseEvent('click', { bubbles: true, cancelable: true }),
+      );
+    });
+    expect(onClick).toHaveBeenCalledTimes(1);
+  });
+
+  it('prevents the synthetic contextmenu while a long-press is pending', () => {
+    render(
+      <TooltipButton tooltip="Pin" data-testid="btn">
+        x
+      </TooltipButton>,
+    );
+    const btn = screen.getByTestId('btn');
+    dispatch(btn, 'pointerdown', { pointerType: 'touch' });
+    act(() => {
+      vi.advanceTimersByTime(100);
+    });
+    const ctx = new MouseEvent('contextmenu', {
+      bubbles: true,
+      cancelable: true,
+    });
+    act(() => {
+      btn.dispatchEvent(ctx);
+    });
+    expect(ctx.defaultPrevented).toBe(true);
+  });
+
+  it('hides the tooltip on pointercancel', () => {
+    render(
+      <TooltipButton tooltip="Pin" data-testid="btn">
+        x
+      </TooltipButton>,
+    );
+    const btn = screen.getByTestId('btn');
+    dispatch(btn, 'pointerdown', { pointerType: 'touch' });
+    act(() => {
+      vi.advanceTimersByTime(500);
+    });
+    expect(screen.getByRole('tooltip')).toBeInTheDocument();
+    dispatch(btn, 'pointercancel', { pointerType: 'touch' });
+    expect(screen.queryByRole('tooltip')).toBeNull();
+  });
+
+  it('shifts the tooltip back inside the viewport when it would overhang', () => {
+    // Install a proto override before the tooltip mounts so the layout
+    // effect sees an overflowing rect on its first measurement pass.
+    const btnRect = {
+      x: 960,
+      y: 12,
+      top: 12,
+      left: 960,
+      right: 1008,
+      bottom: 60,
+      width: 48,
+      height: 48,
+      toJSON() {},
+    } as DOMRect;
+    const tipRect = {
+      x: 904,
+      y: 0,
+      top: 0,
+      left: 904,
+      right: 1064,
+      bottom: 28,
+      width: 160,
+      height: 28,
+      toJSON() {},
+    } as DOMRect;
+    const origProto = Element.prototype.getBoundingClientRect;
+    Element.prototype.getBoundingClientRect = function () {
+      if ((this as Element).getAttribute?.('data-testid') === 'btn') {
+        return btnRect;
+      }
+      if ((this as Element).getAttribute?.('role') === 'tooltip') {
+        return tipRect;
+      }
+      return origProto.call(this);
+    };
+    try {
+      render(
+        <TooltipButton tooltip="Dismiss unpinned" data-testid="btn">
+          x
+        </TooltipButton>,
+      );
+      const btn = screen.getByTestId('btn');
+      dispatch(btn, 'pointerdown', { pointerType: 'touch' });
+      act(() => {
+        vi.advanceTimersByTime(500);
+      });
+      const tip = screen.getByRole('tooltip');
+      // Anchor (button center) at x=984, tooltip width 160 → centered
+      // right edge = 1064. Viewport is 1024, margin 8, so overshoot
+      // is 1064 - (1024 - 8) = 48, yielding a -48 px correction.
+      expect(tip.style.getPropertyValue('--tooltip-x-shift')).toBe('-48px');
+    } finally {
+      Element.prototype.getBoundingClientRect = origProto;
+    }
+  });
+
+  it('still invokes the consumer pointer handlers', () => {
+    const onPointerDown = vi.fn();
+    const onPointerUp = vi.fn();
+    render(
+      <TooltipButton
+        tooltip="Pin"
+        data-testid="btn"
+        onPointerDown={onPointerDown}
+        onPointerUp={onPointerUp}
+      >
+        x
+      </TooltipButton>,
+    );
+    const btn = screen.getByTestId('btn');
+    dispatch(btn, 'pointerdown', { pointerType: 'touch' });
+    dispatch(btn, 'pointerup', { pointerType: 'touch' });
+    expect(onPointerDown).toHaveBeenCalledTimes(1);
+    expect(onPointerUp).toHaveBeenCalledTimes(1);
+  });
+
+  // A natively-`disabled` <button> fires no pointer/hover events in real
+  // browsers, so a disabled TooltipButton could never show its tooltip. We
+  // render the disabled state with aria-disabled so the tooltip still works.
+  describe('soft-disabled (aria-disabled) still shows its tooltip', () => {
+    it('shows the tooltip on a 500ms long-press when disabled', () => {
+      render(
+        <TooltipButton tooltip="Nothing to dismiss" data-testid="btn" disabled>
+          x
+        </TooltipButton>,
+      );
+      const btn = screen.getByTestId('btn');
+      const restore = mockRect(btn, {
+        top: 100,
+        left: 40,
+        width: 44,
+        height: 44,
+        right: 84,
+        bottom: 144,
+      });
+      dispatch(btn, 'pointerdown', { pointerType: 'touch' });
+      act(() => {
+        vi.advanceTimersByTime(500);
+      });
+      expect(screen.getByRole('tooltip')).toHaveTextContent('Nothing to dismiss');
+      restore();
+    });
+
+    it('shows the tooltip on mouse hover when disabled', () => {
+      render(
+        <TooltipButton tooltip="Nothing to undo" data-testid="btn" disabled>
+          x
+        </TooltipButton>,
+      );
+      const btn = screen.getByTestId('btn');
+      const restore = mockRect(btn, {
+        top: 12,
+        left: 40,
+        width: 44,
+        height: 44,
+        right: 84,
+        bottom: 56,
+      });
+      act(() => {
+        fireEvent.pointerEnter(btn, { pointerType: 'mouse', pointerId: 1 });
+      });
+      act(() => {
+        vi.advanceTimersByTime(500);
+      });
+      expect(screen.getByRole('tooltip')).toHaveTextContent('Nothing to undo');
+      restore();
+    });
+
+    it('stays inert: a click does not invoke onClick while disabled', () => {
+      const onClick = vi.fn();
+      render(
+        <TooltipButton tooltip="Pin" data-testid="btn" disabled onClick={onClick}>
+          x
+        </TooltipButton>,
+      );
+      const btn = screen.getByTestId('btn');
+      act(() => {
+        btn.dispatchEvent(
+          new MouseEvent('click', { bubbles: true, cancelable: true }),
+        );
+      });
+      expect(onClick).not.toHaveBeenCalled();
+      expect(btn).toHaveAttribute('aria-disabled', 'true');
+      expect(btn).not.toBeDisabled();
+    });
+  });
+});

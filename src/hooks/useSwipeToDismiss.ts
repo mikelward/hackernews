@@ -1,0 +1,283 @@
+import { onGestureCancel } from '../lib/gestureCancel';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import type { CSSProperties, MouseEvent, PointerEvent } from 'react';
+
+// Commit threshold = max(SWIPE_MIN_PX, SWIPE_RATIO·row width). Kept lighter
+// than a full-quarter drag so a card dismisses without a long deliberate swipe;
+// arming (START_THRESHOLD_PX / ANGLE_RATIO) stays put so it doesn't fight
+// vertical scroll. Readmo mirrors these values — keep the two in sync.
+const SWIPE_RATIO = 0.2;
+const SWIPE_MIN_PX = 48;
+const ANGLE_RATIO = 1.2;
+const START_THRESHOLD_PX = 8;
+const EXIT_DURATION_MS = 200;
+const LONG_PRESS_MS = 500;
+const LONG_PRESS_MOVE_TOLERANCE_PX = 8;
+
+interface Options {
+  onSwipeLeft?: () => void;
+  onSwipeRight?: () => void;
+  onLongPress?: () => void;
+  enabled?: boolean;
+}
+
+interface PointerStart {
+  x: number;
+  y: number;
+  width: number;
+  pointerId: number;
+  swiping: boolean;
+}
+
+export function useSwipeToDismiss({
+  onSwipeLeft,
+  onSwipeRight,
+  onLongPress,
+  enabled = true,
+}: Options) {
+  const [offset, setOffset] = useState(0);
+  const [dragging, setDragging] = useState(false);
+  const [isDismissing, setIsDismissing] = useState(false);
+
+  const startRef = useRef<PointerStart | null>(null);
+  const justSwipedRef = useRef(false);
+  const timeoutRef = useRef<number | null>(null);
+  const longPressTimerRef = useRef<number | null>(null);
+  const onSwipeLeftRef = useRef(onSwipeLeft);
+  const onSwipeRightRef = useRef(onSwipeRight);
+  const onLongPressRef = useRef(onLongPress);
+
+  useEffect(() => {
+    onSwipeLeftRef.current = onSwipeLeft;
+  }, [onSwipeLeft]);
+  useEffect(() => {
+    onSwipeRightRef.current = onSwipeRight;
+  }, [onSwipeRight]);
+  useEffect(() => {
+    onLongPressRef.current = onLongPress;
+  }, [onLongPress]);
+
+  const clearLongPressTimer = useCallback(() => {
+    if (longPressTimerRef.current != null) {
+      window.clearTimeout(longPressTimerRef.current);
+      longPressTimerRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (timeoutRef.current != null) {
+        window.clearTimeout(timeoutRef.current);
+      }
+      clearLongPressTimer();
+    };
+  }, [clearLongPressTimer]);
+
+  const hasAnyHandler = !!(onSwipeLeft || onSwipeRight || onLongPress);
+  const active = enabled && hasAnyHandler;
+
+  // A pinch (or any other multi-touch gesture) has claimed the fingers: abandon
+  // the swipe in flight rather than let its `pointerup` commit. The browser
+  // sends no `pointercancel` for this — the pointer stream is still perfectly
+  // healthy, it just no longer means what this hook thinks it means — so the
+  // broadcast is the only signal. Without it, spreading two fingers across a row
+  // to resize text commits that row's swipe action on release.
+  useEffect(
+    () =>
+      onGestureCancel(() => {
+        if (!startRef.current) return;
+        startRef.current = null;
+        clearLongPressTimer();
+        setDragging(false);
+        setOffset(0);
+        // Swallow the click the browser still fires on lift, the same way the
+        // tail of a real swipe does — otherwise a pinch that started on a row
+        // body opens the story the moment the fingers leave it.
+        justSwipedRef.current = true;
+      }),
+    [clearLongPressTimer],
+  );
+
+  const onPointerDown = useCallback(
+    (e: PointerEvent<HTMLElement>) => {
+      if (!active || isDismissing) return;
+      if (e.pointerType === 'mouse' && e.button !== 0) return;
+      // A pointer is already tracked: a second finger must not clobber the
+      // in-flight gesture's start state (the first finger's swipe would
+      // freeze at its current offset and its release would be ignored).
+      if (startRef.current) return;
+      justSwipedRef.current = false;
+      const rect = e.currentTarget.getBoundingClientRect();
+      startRef.current = {
+        x: e.clientX,
+        y: e.clientY,
+        width: rect.width,
+        pointerId: e.pointerId,
+        swiping: false,
+      };
+      clearLongPressTimer();
+      if (onLongPressRef.current) {
+        longPressTimerRef.current = window.setTimeout(() => {
+          longPressTimerRef.current = null;
+          // Suppress the click that follows pointerup so the underlying
+          // stretched link does not also navigate.
+          justSwipedRef.current = true;
+          startRef.current = null;
+          onLongPressRef.current?.();
+        }, LONG_PRESS_MS);
+      }
+    },
+    [active, isDismissing, clearLongPressTimer],
+  );
+
+  const onPointerMove = useCallback((e: PointerEvent<HTMLElement>) => {
+    const start = startRef.current;
+    if (!start || start.pointerId !== e.pointerId) return;
+    // Pointer capture is only taken once a swipe arms, so a mouse/pen press
+    // released OUTSIDE the row never delivers its pointerup and the start
+    // state goes stale. A hover-capable pointer moving with no button held
+    // is that stale case (a mouse keeps one pointerId for the whole
+    // session): resuming from it would drag the row under a button-less
+    // hover and let a later plain click commit a swipe action. Drop it.
+    // Touch is excluded — contact implies buttons=1 and implicit capture
+    // always delivers the touch's pointerup/pointercancel.
+    if (
+      e.buttons === 0 &&
+      (e.pointerType === 'mouse' || e.pointerType === 'pen')
+    ) {
+      startRef.current = null;
+      clearLongPressTimer();
+      return;
+    }
+    const dx = e.clientX - start.x;
+    const dy = e.clientY - start.y;
+    if (
+      longPressTimerRef.current != null &&
+      Math.hypot(dx, dy) > LONG_PRESS_MOVE_TOLERANCE_PX
+    ) {
+      clearLongPressTimer();
+    }
+    if (!start.swiping) {
+      if (Math.abs(dx) < START_THRESHOLD_PX) return;
+      if (Math.abs(dx) < Math.abs(dy) * ANGLE_RATIO) {
+        startRef.current = null;
+        clearLongPressTimer();
+        return;
+      }
+      start.swiping = true;
+      clearLongPressTimer();
+      setDragging(true);
+      try {
+        e.currentTarget.setPointerCapture(e.pointerId);
+      } catch {
+        // jsdom / unsupported: safe to ignore
+      }
+    }
+    setOffset(dx);
+  }, [clearLongPressTimer]);
+
+  const onPointerUp = useCallback((e: PointerEvent<HTMLElement>) => {
+    const start = startRef.current;
+    if (!start || start.pointerId !== e.pointerId) return;
+    const dx = e.clientX - start.x;
+    const threshold = Math.max(SWIPE_MIN_PX, start.width * SWIPE_RATIO);
+    const width = start.width;
+    const wasSwiping = start.swiping;
+    startRef.current = null;
+    clearLongPressTimer();
+    setDragging(false);
+
+    const dir = dx >= 0 ? 1 : -1;
+    const handler =
+      dir > 0 ? onSwipeRightRef.current : onSwipeLeftRef.current;
+
+    if (wasSwiping && Math.abs(dx) >= threshold && handler) {
+      justSwipedRef.current = true;
+      setIsDismissing(true);
+      setOffset(dir * Math.max(width, 300));
+      timeoutRef.current = window.setTimeout(() => {
+        handler();
+        // If the parent kept the row mounted (e.g. save, not dismiss), reset
+        // so the row snaps back to its resting position instead of staying
+        // translated off-screen.
+        setIsDismissing(false);
+        setOffset(0);
+      }, EXIT_DURATION_MS);
+    } else {
+      setOffset(0);
+      if (wasSwiping) justSwipedRef.current = true;
+    }
+  }, [clearLongPressTimer]);
+
+  const onPointerCancel = useCallback((e: PointerEvent<HTMLElement>) => {
+    const start = startRef.current;
+    if (!start || start.pointerId !== e.pointerId) return;
+    startRef.current = null;
+    clearLongPressTimer();
+    setDragging(false);
+    setOffset(0);
+  }, [clearLongPressTimer]);
+
+  const onContextMenu = useCallback((e: MouseEvent) => {
+    // If a long-press just fired we own the gesture; suppress the OS menu.
+    if (justSwipedRef.current || onLongPressRef.current) {
+      e.preventDefault();
+    }
+  }, []);
+
+  const onClickCapture = useCallback((e: MouseEvent) => {
+    if (!justSwipedRef.current) return;
+    // The menu opened by a long-press is rendered in a portal outside this
+    // row's DOM. React still routes its events through the React tree, so we
+    // must let those clicks through instead of swallowing them.
+    const currentTarget = e.currentTarget as Node | null;
+    const target = e.target as Node | null;
+    if (currentTarget && target && !currentTarget.contains(target)) {
+      return;
+    }
+    // This guard exists to cancel an accidental activation of the row BODY
+    // (its link) at the tail of a swipe — not to eat a deliberate tap on an
+    // action control. The row's Pin/menu buttons stop their own pointerdown
+    // from reaching this hook (TooltipButton.handlePointerDown), so
+    // `justSwiped` never gets cleared by pressing them the way a row-body tap
+    // clears it. If a prior row-body gesture (a below-threshold scrub, a
+    // long-press) left `justSwiped` armed, swallowing the click here would
+    // make the *next* button tap a silent no-op. Let taps that land on a
+    // button through untouched (their own onClick handles them).
+    if (target instanceof Element && target.closest('button')) {
+      justSwipedRef.current = false;
+      return;
+    }
+    e.preventDefault();
+    e.stopPropagation();
+    justSwipedRef.current = false;
+  }, []);
+
+  const style: CSSProperties =
+    offset === 0 && !isDismissing
+      ? {}
+      : {
+          transform: `translate3d(${offset}px, 0, 0)`,
+          opacity: isDismissing
+            ? 0
+            : Math.max(0.4, 1 - Math.abs(offset) / 500),
+          transition: dragging
+            ? 'none'
+            : `transform ${EXIT_DURATION_MS}ms ease-out, opacity ${EXIT_DURATION_MS}ms ease-out`,
+        };
+
+  return {
+    offset,
+    dragging,
+    isDismissing,
+    style,
+    handlers: {
+      onPointerDown,
+      onPointerMove,
+      onPointerUp,
+      onPointerCancel,
+      onClickCapture,
+      onContextMenu,
+    },
+  };
+}

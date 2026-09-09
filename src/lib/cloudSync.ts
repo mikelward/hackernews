@@ -1,0 +1,1183 @@
+// Cross-device sync glue. Pulls Pinned / Favorite / Hidden / Done /
+// Avatar from /api/sync on login, reconnect, and tab-visibility change,
+// listens to the five change events, and debounces local changes into
+// a single POST ~2 s later. Merge is per-id last-write-wins for the
+// four lists and single-record last-write-wins for the avatar prefs,
+// matching the server.
+//
+// Fail-open: any error (server down, offline, 5xx) is swallowed and
+// retried on the next event or reconnect. Local storage remains the
+// source of truth for the UI; /api/sync is purely additive.
+
+import { trackedFetch, subscribeOnline } from './networkStatus';
+import {
+  PINNED_STORIES_CHANGE_EVENT,
+  getAllPinnedEntries,
+  replacePinnedEntries,
+  type PinnedEntry,
+} from './pinnedStories';
+import {
+  FAVORITES_CHANGE_EVENT,
+  getAllFavoriteEntries,
+  replaceFavoriteEntries,
+  type FavoriteEntry,
+} from './favorites';
+import {
+  HIDDEN_STORIES_CHANGE_EVENT,
+  getAllHiddenEntries,
+  replaceHiddenEntries,
+  type HiddenEntry,
+} from './hiddenStories';
+import {
+  DONE_STORIES_CHANGE_EVENT,
+  getAllDoneEntries,
+  replaceDoneEntries,
+  type DoneEntry,
+} from './doneStories';
+import {
+  AVATAR_PREFS_CHANGE_EVENT,
+  getStoredAvatarPrefs,
+  replaceAvatarPrefs,
+  type AvatarPrefs,
+  type AvatarSource,
+} from './avatarPrefs';
+import {
+  HOT_THRESHOLDS_CHANGE_EVENT,
+  getStoredHotThresholds,
+  replaceHotThresholds,
+  type HotThresholds,
+} from './hotThresholds';
+
+export const SYNC_DEBOUNCE_MS = 2000;
+// Body-size ceiling for a keepalive POST. The fetch keepalive budget is
+// ~64 KB shared across in-flight keepalive requests; stay comfortably
+// under it so a flush-on-hide POST that fits sends with keepalive and a
+// larger one falls back to a normal POST rather than failing outright.
+export const KEEPALIVE_MAX_BODY_BYTES = 60_000;
+// Visibility-triggered pulls are gated: tab-switching shouldn't hammer
+// /api/sync. One pull per half-minute of visibility change is plenty
+// for the "I switched to this tab, show me the latest" case.
+const VISIBILITY_PULL_MIN_INTERVAL_MS = 30_000;
+
+export interface SyncEntry {
+  id: number;
+  at: number;
+  deleted?: true;
+}
+
+export interface SyncAvatar {
+  source: AvatarSource;
+  githubUsername?: string;
+  gravatarHash?: string;
+  at: number;
+}
+
+// Wire shape for the per-user `/hot` rule. Mirrors `HotThresholds` in
+// `./hotThresholds.ts` but always carries an `at` (the localStorage
+// shape's `at` is optional for pristine devices). `toSyncHotThresholds`
+// below drops the record entirely when `at` is missing/zero, so the
+// server only ever sees stamped records.
+export interface SyncHotThresholds {
+  topEnabled: boolean;
+  topScoreMin: number;
+  topDescendantsMin: number;
+  newEnabled: boolean;
+  newVelocityMin: number;
+  newDescendantsMin: number;
+  at: number;
+}
+
+export interface SyncState {
+  pinned: SyncEntry[];
+  favorite: SyncEntry[];
+  hidden: SyncEntry[];
+  done: SyncEntry[];
+  avatar?: SyncAvatar;
+  hotThresholds?: SyncHotThresholds;
+}
+
+type ListName = 'pinned' | 'favorite' | 'hidden' | 'done';
+
+export function mergeEntries(
+  current: SyncEntry[],
+  incoming: SyncEntry[],
+): SyncEntry[] {
+  const byId = new Map<number, SyncEntry>();
+  for (const e of current) byId.set(e.id, e);
+  for (const e of incoming) {
+    const existing = byId.get(e.id);
+    if (!existing || e.at > existing.at) byId.set(e.id, e);
+  }
+  return Array.from(byId.values()).sort((a, b) => a.id - b.id);
+}
+
+function maxAt(entries: SyncEntry[]): number {
+  let m = 0;
+  for (const e of entries) if (e.at > m) m = e.at;
+  return m;
+}
+
+// Module-level singleton. There's exactly one signed-in user per
+// browsing session and one set of localStorage stores, so there's no
+// reason to instantiate this per-component.
+interface SyncRuntime {
+  username: string;
+  lastPushed: Record<ListName, number>;
+  // High-water mark for the avatar record. Advanced whenever we
+  // successfully POST or observe a server value at that `at` — same
+  // idea as lastPushed for the lists, but for a single record.
+  lastPushedAvatar: number;
+  // Same idea for the per-user Hot-threshold overrides configured by
+  // Hot customize panel on `/hot`.
+  lastPushedHotThresholds: number;
+  pushTimer: ReturnType<typeof setTimeout> | null;
+  pushInFlight: boolean;
+  pushQueued: boolean;
+  unsubscribeOnline: (() => void) | null;
+  unsubscribeVisibility: (() => void) | null;
+  onChange: () => void;
+  fetchImpl: typeof fetch;
+  debounceMs: number;
+  // Timestamp of the most recent pull attempt (any outcome). Used to
+  // gate visibility-change pulls.
+  lastPullAttemptAt: number;
+}
+
+let runtime: SyncRuntime | null = null;
+
+// Debug snapshot — populated whenever pull/push completes, regardless
+// of outcome. Survives stopCloudSync so the debug panel can still show
+// "last pull 5 s ago, failed with 503" after a user signs out.
+export interface CloudSyncDebugSnapshot {
+  running: boolean;
+  username: string | null;
+  lastPushed: Record<ListName, number>;
+  lastPushedAvatar: number;
+  lastPushedHotThresholds: number;
+  pendingCount: Record<ListName, number>;
+  pendingAvatar: boolean;
+  pendingHotThresholds: boolean;
+  push: { inFlight: boolean; queued: boolean; timerPending: boolean };
+  lastPull: LastRequest | null;
+  lastPush: LastRequest | null;
+  // Set only when a boot-hint read/write threw; see noteHintFailure.
+  lastHintFailure: HintFailure | null;
+}
+
+export interface HintFailure {
+  at: number;
+  op: 'read' | 'write' | 'clear';
+  error: string;
+}
+
+export interface LastRequest {
+  at: number;
+  ok: boolean;
+  status?: number;
+  // For GET: counts of entries returned by the server. For POST: counts
+  // in the delta we sent. The avatar flag is true when an avatar record
+  // was present in the response (GET) or the delta (POST). Same shape
+  // for the hotThresholds flag.
+  counts?: Record<ListName, number>;
+  avatar?: boolean;
+  hotThresholds?: boolean;
+  error?: string;
+}
+
+let lastPull: LastRequest | null = null;
+let lastPush: LastRequest | null = null;
+let lastHintFailure: HintFailure | null = null;
+
+const debugSubscribers = new Set<() => void>();
+
+function notifyDebug(): void {
+  for (const fn of debugSubscribers) {
+    try {
+      fn();
+    } catch {
+      // A subscriber throwing must not derail other subscribers or the
+      // underlying pull/push flow.
+    }
+  }
+}
+
+function errorMessage(e: unknown): string {
+  if (e instanceof Error) return e.message;
+  try {
+    return String(e);
+  } catch {
+    return 'unknown error';
+  }
+}
+
+function asEntries(list: SyncEntry[]): SyncEntry[] {
+  return list.map((e) => {
+    const out: SyncEntry = { id: e.id, at: e.at };
+    if (e.deleted) out.deleted = true;
+    return out;
+  });
+}
+
+function readLocal(list: ListName): SyncEntry[] {
+  switch (list) {
+    case 'pinned':
+      return asEntries(getAllPinnedEntries());
+    case 'favorite':
+      return asEntries(getAllFavoriteEntries());
+    case 'hidden':
+      return asEntries(getAllHiddenEntries());
+    case 'done':
+      return asEntries(getAllDoneEntries());
+  }
+}
+
+function writeLocal(list: ListName, entries: SyncEntry[]): void {
+  switch (list) {
+    case 'pinned':
+      replacePinnedEntries(entries as PinnedEntry[]);
+      return;
+    case 'favorite':
+      replaceFavoriteEntries(entries as FavoriteEntry[]);
+      return;
+    case 'hidden':
+      replaceHiddenEntries(entries as HiddenEntry[]);
+      return;
+    case 'done':
+      replaceDoneEntries(entries as DoneEntry[]);
+      return;
+  }
+}
+
+// Strip the raw email before shipping the record over the wire: we
+// intentionally never send it, since the server only needs the hash
+// to build the Gravatar URL on other devices. Also strips anything
+// that isn't a valid avatar shape (e.g. an `at` that snuck in as 0).
+function toSyncAvatar(prefs: AvatarPrefs): SyncAvatar | null {
+  if (!prefs.at || prefs.at <= 0) return null;
+  const out: SyncAvatar = { source: prefs.source, at: prefs.at };
+  if (prefs.githubUsername) out.githubUsername = prefs.githubUsername;
+  if (prefs.gravatarHash) out.gravatarHash = prefs.gravatarHash;
+  return out;
+}
+
+function localAvatarAt(): number {
+  const prefs = getStoredAvatarPrefs();
+  return typeof prefs.at === 'number' ? prefs.at : 0;
+}
+
+// Same shape conversion as `toSyncAvatar`: drop pristine records
+// (`at` missing/zero) so we don't ship a record that hasn't been
+// user-edited. The server's mergeHotThresholds would happily accept
+// it, but pushing a `at: 0` record means every newer device would
+// then "win" a comparison against it, which is correct but pointless
+// — better to not send anything and let other devices' edits land.
+function toSyncHotThresholds(prefs: HotThresholds): SyncHotThresholds | null {
+  if (!prefs.at || prefs.at <= 0) return null;
+  return {
+    topEnabled: prefs.topEnabled,
+    topScoreMin: prefs.topScoreMin,
+    topDescendantsMin: prefs.topDescendantsMin,
+    newEnabled: prefs.newEnabled,
+    newVelocityMin: prefs.newVelocityMin,
+    newDescendantsMin: prefs.newDescendantsMin,
+    at: prefs.at,
+  };
+}
+
+function localHotThresholdsAt(): number {
+  const prefs = getStoredHotThresholds();
+  return typeof prefs.at === 'number' ? prefs.at : 0;
+}
+
+// Merge a server snapshot into the local stores, and — when there's a
+// runtime to hold it — advance the push watermarks.
+//
+// The two halves are split by that guard on purpose: the boot-primed
+// pull (see primeCloudSyncPull) lands before auth has resolved and so
+// before any runtime exists, and its lists are worth writing *then*
+// rather than sitting in a resolved promise until React mounts. Merging
+// is what makes a pin from another device visible — the stores are the
+// UI's source of truth, and their change events are what start the
+// content warm (see startPinnedOfflineSync). The watermarks wait for the
+// runtime; `initialPull` applies the same snapshot again a moment later,
+// which is idempotent for the merge and is where they get set.
+function applyServerState(state: SyncState): void {
+  const lists: ListName[] = ['pinned', 'favorite', 'hidden', 'done'];
+  for (const list of lists) {
+    // Tolerate a missing list on the server response — an older server
+    // that predates the Done rollout won't return `done` at all, and we
+    // don't want to crash the pull path during the deploy window.
+    const incoming = state[list] ?? [];
+    const merged = mergeEntries(readLocal(list), incoming);
+    writeLocal(list, merged);
+    // Advance the watermark only past entries the server is known to
+    // cover. Blindly bumping to the server's max `at` would classify
+    // every *local-only* entry older than that as "already pushed" —
+    // collectDelta would skip it forever, so e.g. pins made on this
+    // device before sign-in would never reach the server once another
+    // device had pushed anything newer.
+    if (!runtime) continue;
+    const incomingAt = new Map(incoming.map((e) => [e.id, e.at]));
+    let bump = maxAt(incoming);
+    for (const e of merged) {
+      const serverAt = incomingAt.get(e.id);
+      const coveredByServer = serverAt !== undefined && serverAt >= e.at;
+      if (!coveredByServer && e.at <= bump) bump = e.at - 1;
+    }
+    runtime.lastPushed[list] = Math.max(runtime.lastPushed[list], bump);
+  }
+  if (state.avatar) {
+    // LWW on a single record: strictly-newer server `at` overwrites
+    // local, otherwise we keep the local copy. The local
+    // `gravatarEmail` is deliberately not preserved on server-wins
+    // because another device may have rotated the hash; the edit form
+    // will show an empty email and the user can retype if they want
+    // it to round-trip for display.
+    const localAt = localAvatarAt();
+    if (state.avatar.at > localAt) {
+      const next: AvatarPrefs = {
+        source: state.avatar.source,
+        at: state.avatar.at,
+      };
+      if (state.avatar.githubUsername) {
+        next.githubUsername = state.avatar.githubUsername;
+      }
+      if (state.avatar.gravatarHash) {
+        next.gravatarHash = state.avatar.gravatarHash;
+      }
+      replaceAvatarPrefs(next);
+    }
+    if (runtime) {
+      runtime.lastPushedAvatar = Math.max(
+        runtime.lastPushedAvatar,
+        state.avatar.at,
+      );
+    }
+  }
+  if (state.hotThresholds) {
+    // Same single-record LWW for the per-user Hot rule.
+    const localAt = localHotThresholdsAt();
+    if (state.hotThresholds.at > localAt) {
+      const next: HotThresholds = {
+        topEnabled: state.hotThresholds.topEnabled,
+        topScoreMin: state.hotThresholds.topScoreMin,
+        topDescendantsMin: state.hotThresholds.topDescendantsMin,
+        newEnabled: state.hotThresholds.newEnabled,
+        newVelocityMin: state.hotThresholds.newVelocityMin,
+        newDescendantsMin: state.hotThresholds.newDescendantsMin,
+        at: state.hotThresholds.at,
+      };
+      replaceHotThresholds(next);
+    }
+    if (runtime) {
+      runtime.lastPushedHotThresholds = Math.max(
+        runtime.lastPushedHotThresholds,
+        state.hotThresholds.at,
+      );
+    }
+  }
+}
+
+function collectDelta(): SyncState {
+  if (!runtime) return { pinned: [], favorite: [], hidden: [], done: [] };
+  const delta: SyncState = {
+    pinned: readLocal('pinned').filter(
+      (e) => e.at > runtime!.lastPushed.pinned,
+    ),
+    favorite: readLocal('favorite').filter(
+      (e) => e.at > runtime!.lastPushed.favorite,
+    ),
+    hidden: readLocal('hidden').filter(
+      (e) => e.at > runtime!.lastPushed.hidden,
+    ),
+    done: readLocal('done').filter(
+      (e) => e.at > runtime!.lastPushed.done,
+    ),
+  };
+  const localPrefs = getStoredAvatarPrefs();
+  const candidate = toSyncAvatar(localPrefs);
+  if (candidate && candidate.at > runtime.lastPushedAvatar) {
+    delta.avatar = candidate;
+  }
+  const localHot = getStoredHotThresholds();
+  const hotCandidate = toSyncHotThresholds(localHot);
+  if (hotCandidate && hotCandidate.at > runtime.lastPushedHotThresholds) {
+    delta.hotThresholds = hotCandidate;
+  }
+  return delta;
+}
+
+// The GET half of a pull, with none of the applying. Split out so the
+// boot-time prime below can put the request on the wire before there's
+// a runtime to apply the answer to.
+async function fetchSyncState(
+  fetchImpl: typeof fetch,
+  startedAt: number,
+): Promise<SyncState | null> {
+  let res: Response;
+  try {
+    res = await fetchImpl('/api/sync', { method: 'GET' });
+  } catch (e) {
+    lastPull = { at: startedAt, ok: false, error: errorMessage(e) };
+    notifyDebug();
+    return null;
+  }
+  if (!res.ok) {
+    // The origin's own proof that this browser has nothing to sync —
+    // stop priming boot pulls for it until it signs in again.
+    if (res.status === 401) writeSyncHint(false);
+    lastPull = { at: startedAt, ok: false, status: res.status };
+    notifyDebug();
+    return null;
+  }
+  let server: unknown;
+  try {
+    server = await res.json();
+  } catch {
+    lastPull = {
+      at: startedAt,
+      ok: false,
+      status: res.status,
+      error: 'invalid-json',
+    };
+    notifyDebug();
+    return null;
+  }
+  if (!isSyncState(server)) {
+    lastPull = {
+      at: startedAt,
+      ok: false,
+      status: res.status,
+      error: 'invalid-shape',
+    };
+    notifyDebug();
+    return null;
+  }
+  writeSyncHint(true);
+  lastPull = {
+    at: startedAt,
+    ok: true,
+    status: res.status,
+    counts: {
+      pinned: server.pinned.length,
+      favorite: server.favorite.length,
+      hidden: server.hidden.length,
+      done: server.done?.length ?? 0,
+    },
+    avatar: !!server.avatar,
+    hotThresholds: !!server.hotThresholds,
+  };
+  return server;
+}
+
+async function pull(): Promise<void> {
+  if (!runtime) return;
+  // Snapshot the runtime: stopCloudSync (sign-out) or a stop/start for
+  // a different user can swap it while the GET is in flight, and we
+  // must not apply user A's server state to user B's session.
+  const rt = runtime;
+  rt.lastPullAttemptAt = Date.now();
+  const server = await fetchSyncState(rt.fetchImpl, rt.lastPullAttemptAt);
+  // Bail if sync was stopped or restarted for another user while the
+  // GET was in flight — the response belongs to the old session.
+  if (server && runtime === rt) applyServerState(server);
+  notifyDebug();
+}
+
+// === Boot-time pull priming ===
+//
+// The pull that carries a pin made on another device into this browser
+// can't normally start until the persisted query cache has rehydrated
+// from IndexedDB and React has mounted far enough for auth to resolve —
+// a few hundred milliseconds on a phone, spent before the request that
+// even *mentions* the new pin goes on the wire. Only then can the item
+// and its summaries be fetched, so every one of those milliseconds sits
+// at the front of a serial chain the reader watches.
+//
+// `/api/sync` is authenticated by the session cookie alone, so the GET
+// needs none of that: fire it from the entry module and hand the answer
+// to startCloudSync when it arrives there.
+//
+// Cost: no extra request in the normal case — the primed response is
+// consumed *instead of* the one startCloudSync would have made. A reader
+// who signs out pays one 401 on their next boot, after which the hint
+// below is cleared and nothing is primed until they sign in again. No
+// new infrastructure, and a failed prime is indistinguishable from a
+// failed pull: startCloudSync falls back to its own GET.
+const PRIME_MAX_AGE_MS = 60_000;
+// Only records *that* this browser has synced, never who as — see the
+// privacy rule in AGENTS.md.
+export const SYNC_HINT_KEY = 'newshacker:cloudSyncSeen';
+
+// A hint read/write that threw. Neither failure is fatal — the fallback
+// is "don't prime, pull normally" — but both are invisible from the
+// outside: a failed write silently disables boot priming for the life of
+// the device, and a failed clear leaves a signed-out reader paying a 401
+// on every boot. There is no console logging anywhere in `src/lib` and
+// no logger to hook into, so this module's existing debug channel (the
+// one `/debug`'s CloudSyncDebugPanel renders) is where it goes. The
+// error's `message` is a DOM exception name; the key and value are ours,
+// so nothing here is user data.
+function noteHintFailure(op: 'read' | 'write' | 'clear', e: unknown): void {
+  lastHintFailure = { at: Date.now(), op, error: errorMessage(e) };
+  notifyDebug();
+}
+
+function writeSyncHint(seen: boolean): void {
+  try {
+    if (seen) window.localStorage.setItem(SYNC_HINT_KEY, '1');
+    else window.localStorage.removeItem(SYNC_HINT_KEY);
+  } catch (e) {
+    // Privacy-mode or quota failure. The hint is an optimization; without
+    // it the boot pull simply isn't primed and startCloudSync pulls
+    // itself — so this is recorded, not raised.
+    noteHintFailure(seen ? 'write' : 'clear', e);
+  }
+}
+
+function hasSyncHint(): boolean {
+  try {
+    return window.localStorage.getItem(SYNC_HINT_KEY) === '1';
+  } catch (e) {
+    noteHintFailure('read', e);
+    return false;
+  }
+}
+
+// Bumped whenever the signed-in session changes: a runtime starting, a
+// running one stopping, or the cookie itself being replaced by a login
+// or logout (see noteCloudSyncAuthChange). The primed pull captures it
+// and refuses to apply a snapshot across a change — the GET is
+// cookie-authenticated at send time, so a response that lands after a
+// sign-out or an account switch belongs to the session that asked for
+// it, not the one now in front of the reader.
+let syncGeneration = 0;
+
+// Called by `useAuth` when a login or logout completes. Runtime
+// lifecycle alone can't see this: a login replaces the cookie while
+// `runtime` may still be null (auth hasn't resolved yet on a cold boot,
+// so nothing has started and `stopCloudSync` returns before its bump) —
+// and then the *new* account's `startCloudSync` would find a prime that
+// matches its generation, apply the previous account's lists, and take
+// them as its own push watermarks. Bumping here makes the prime
+// unusable across any identity change, whether or not a runtime existed
+// to observe it.
+export function noteCloudSyncAuthChange(): void {
+  syncGeneration += 1;
+}
+
+interface PrimedPull {
+  at: number;
+  generation: number;
+  state: Promise<SyncState | null>;
+}
+
+let primedPull: PrimedPull | null = null;
+
+// Call once, as early in the entry module as possible. Resolves when the
+// primed GET settles (null if it didn't happen or failed), so a caller
+// can hang further warming off it.
+export function primeCloudSyncPull(
+  opts: { fetchImpl?: typeof fetch; now?: number } = {},
+): Promise<SyncState | null> {
+  if (primedPull) return primedPull.state;
+  if (!hasSyncHint()) return Promise.resolve(null);
+  const at = opts.now ?? Date.now();
+  const generation = syncGeneration;
+  const state = fetchSyncState(opts.fetchImpl ?? trackedFetch, at).then(
+    (server) => {
+      // Merge it into the local stores the moment it lands rather than
+      // holding it for startCloudSync: the stores are what the UI reads
+      // and what the pinned offline warm listens to, so this is the
+      // point at which a pin made on another device both exists on this
+      // device and starts downloading — no waiting on rehydrate, React
+      // mount, or auth. The watermark half of applyServerState is
+      // skipped without a runtime and runs on the same snapshot in
+      // `initialPull`.
+      //
+      // Two conditions bound that, because this response carries no
+      // identity of its own: the session must not have changed since the
+      // GET was sent (a hung request that lands after a sign-out or an
+      // account switch would otherwise write the *previous* account's
+      // lists into stores the current one reads), and it must still be
+      // current by the same 60 s rule `initialPull` applies. A snapshot
+      // that fails either is still returned — it just isn't applied here
+      // — and `initialPull` re-checks both before using it.
+      if (!server) return null;
+      if (syncGeneration !== generation) return server;
+      if (Date.now() - at >= PRIME_MAX_AGE_MS) return server;
+      applyServerState(server);
+      return server;
+    },
+  );
+  primedPull = { at, generation, state };
+  return state;
+}
+
+// The pull startCloudSync opens with: the primed response when it's
+// usable, otherwise a fresh GET. Three things make it unusable, and each
+// falls back rather than skipping the pull — an initial pull that
+// silently doesn't happen leaves remote changes missing until some later
+// reconnect or visibility trigger:
+//
+//   - it was fired before a session change (`generationBefore` is the
+//     generation as of this start, so the boot case still matches), or
+//     a session change lands while we're waiting on it, so the response
+//     can't be attributed to this session;
+//   - it's older than the freshness window;
+//   - it failed — network, non-OK, unparsable, wrong shape.
+//
+// Consumed by whichever start gets there first, whatever the outcome, so
+// one primed snapshot can never be applied twice or handed on.
+async function initialPull(
+  rt: SyncRuntime,
+  generationBefore: number,
+): Promise<void> {
+  const primed = primedPull;
+  primedPull = null;
+  // The generation this start owns — startCloudSync bumped it a few
+  // lines above, so this is the value a login or logout during the
+  // await would move.
+  const generationAtStart = syncGeneration;
+  const usable =
+    primed !== null &&
+    primed.generation === generationBefore &&
+    Date.now() - primed.at < PRIME_MAX_AGE_MS;
+  if (!usable) {
+    await pull();
+    return;
+  }
+  rt.lastPullAttemptAt = primed.at;
+  const server = await primed.state;
+  // All three conditions are re-checked *after* the await, not just
+  // before it: a request that was young enough when we started waiting
+  // can settle on the far side of the window, the runtime can be
+  // swapped while we wait, and — the case neither of those covers —
+  // `noteCloudSyncAuthChange` can fire from a login or logout while
+  // `runtime` is still this one, because React's `useCloudSync` effect
+  // runs a tick behind the cookie changing. Either way the answer is a
+  // fresh pull, not an expired or misattributed snapshot.
+  if (runtime !== rt) return;
+  if (
+    !server ||
+    syncGeneration !== generationAtStart ||
+    Date.now() - primed.at >= PRIME_MAX_AGE_MS
+  ) {
+    // A failed, expired, or now-misattributed prime. `lastPull`
+    // already records why a failed one failed; this is the fallback its
+    // own doc promises. `pull()` re-fetches under whatever cookie is
+    // current and re-checks the runtime before applying, so it is the
+    // right answer for the auth-change case too.
+    await pull();
+    return;
+  }
+  applyServerState(server);
+  notifyDebug();
+}
+
+async function push(opts: { keepalive?: boolean } = {}): Promise<void> {
+  if (!runtime) return;
+  // Snapshot for the same reason as pull(): the runtime can be nulled
+  // (sign-out) or replaced (different user) during the POST, and the
+  // post-await watermark bumps must not land on the wrong runtime —
+  // that would both throw on null and suppress the new session's
+  // first delta.
+  const rt = runtime;
+  const delta = collectDelta();
+  const total =
+    delta.pinned.length +
+    delta.favorite.length +
+    delta.hidden.length +
+    delta.done.length;
+  const hasAvatarDelta = !!delta.avatar;
+  const hasHotDelta = !!delta.hotThresholds;
+  if (total === 0 && !hasAvatarDelta && !hasHotDelta) return;
+
+  const deltaCounts: Record<ListName, number> = {
+    pinned: delta.pinned.length,
+    favorite: delta.favorite.length,
+    hidden: delta.hidden.length,
+    done: delta.done.length,
+  };
+  const deltaMax = {
+    pinned: maxAt(delta.pinned),
+    favorite: maxAt(delta.favorite),
+    hidden: maxAt(delta.hidden),
+    done: maxAt(delta.done),
+  };
+  const deltaAvatarAt = delta.avatar ? delta.avatar.at : 0;
+  const deltaHotAt = delta.hotThresholds ? delta.hotThresholds.at : 0;
+  const startedAt = Date.now();
+  const body = JSON.stringify(delta);
+  // keepalive lets the flush-on-hide/pagehide POST outlive a page that's
+  // being backgrounded or discarded (a normal fetch can be cancelled on
+  // unload). But keepalive bodies share a ~64 KB browser budget, far
+  // below the 256 KiB api/sync.ts accepts — a heavy reader's initial or
+  // retried delta (thousands of Pinned/Done/Favorite entries) can exceed
+  // it. So only set keepalive when the caller asked for it AND the body
+  // fits; an oversized flush falls back to a normal POST, which still
+  // completes when the page merely backgrounds (the common case) rather
+  // than truly unloading.
+  const keepalive = !!opts.keepalive && body.length <= KEEPALIVE_MAX_BODY_BYTES;
+  const init: RequestInit = {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body,
+  };
+  if (keepalive) init.keepalive = true;
+
+  let res: Response;
+  try {
+    res = await rt.fetchImpl('/api/sync', init);
+  } catch (e) {
+    lastPush = {
+      at: startedAt,
+      ok: false,
+      counts: deltaCounts,
+      avatar: hasAvatarDelta,
+      hotThresholds: hasHotDelta,
+      error: errorMessage(e),
+    };
+    notifyDebug();
+    return;
+  }
+  if (!res.ok) {
+    lastPush = {
+      at: startedAt,
+      ok: false,
+      status: res.status,
+      counts: deltaCounts,
+      avatar: hasAvatarDelta,
+      hotThresholds: hasHotDelta,
+    };
+    notifyDebug();
+    return;
+  }
+
+  let server: unknown;
+  try {
+    server = await res.json();
+  } catch {
+    lastPush = {
+      at: startedAt,
+      ok: false,
+      status: res.status,
+      counts: deltaCounts,
+      avatar: hasAvatarDelta,
+      hotThresholds: hasHotDelta,
+      error: 'invalid-json',
+    };
+    notifyDebug();
+    return;
+  }
+  if (!isSyncState(server)) {
+    lastPush = {
+      at: startedAt,
+      ok: false,
+      status: res.status,
+      counts: deltaCounts,
+      avatar: hasAvatarDelta,
+      hotThresholds: hasHotDelta,
+      error: 'invalid-shape',
+    };
+    notifyDebug();
+    return;
+  }
+
+  // Bail if sync was stopped or restarted for another user while the
+  // POST was in flight: `rt` is dead, and writing to the live runtime
+  // would contaminate the new session's watermarks. Still record the
+  // outcome so the debug panel reflects what happened on the wire.
+  if (runtime !== rt) {
+    lastPush = {
+      at: startedAt,
+      ok: true,
+      status: res.status,
+      counts: deltaCounts,
+      avatar: hasAvatarDelta,
+      hotThresholds: hasHotDelta,
+    };
+    notifyDebug();
+    return;
+  }
+
+  // Raise the high-water mark for everything we just successfully
+  // pushed, BEFORE applying the server response. If we bumped only
+  // after applyServerState, a concurrent change event firing between
+  // the two calls could trigger a schedulePush that re-sends the same
+  // delta. Bumping first makes collectDelta correctly skip entries
+  // that are already on the server.
+  rt.lastPushed.pinned = Math.max(rt.lastPushed.pinned, deltaMax.pinned);
+  rt.lastPushed.favorite = Math.max(rt.lastPushed.favorite, deltaMax.favorite);
+  rt.lastPushed.hidden = Math.max(rt.lastPushed.hidden, deltaMax.hidden);
+  rt.lastPushed.done = Math.max(rt.lastPushed.done, deltaMax.done);
+  if (hasAvatarDelta) {
+    rt.lastPushedAvatar = Math.max(rt.lastPushedAvatar, deltaAvatarAt);
+  }
+  if (hasHotDelta) {
+    rt.lastPushedHotThresholds = Math.max(
+      rt.lastPushedHotThresholds,
+      deltaHotAt,
+    );
+  }
+
+  applyServerState(server);
+  lastPush = {
+    at: startedAt,
+    ok: true,
+    status: res.status,
+    counts: deltaCounts,
+    avatar: hasAvatarDelta,
+    hotThresholds: hasHotDelta,
+  };
+  notifyDebug();
+}
+
+function isAvatarSource(v: unknown): v is AvatarSource {
+  return v === 'github' || v === 'gravatar' || v === 'none';
+}
+
+function isSyncAvatar(x: unknown): x is SyncAvatar {
+  if (typeof x !== 'object' || x === null) return false;
+  const obj = x as Record<string, unknown>;
+  if (!isAvatarSource(obj.source)) return false;
+  if (typeof obj.at !== 'number' || !Number.isFinite(obj.at) || obj.at < 0) {
+    return false;
+  }
+  return true;
+}
+
+function isSyncHotThresholds(x: unknown): x is SyncHotThresholds {
+  if (typeof x !== 'object' || x === null) return false;
+  const obj = x as Record<string, unknown>;
+  if (typeof obj.topEnabled !== 'boolean') return false;
+  if (typeof obj.newEnabled !== 'boolean') return false;
+  for (const k of [
+    'topScoreMin',
+    'topDescendantsMin',
+    'newVelocityMin',
+    'newDescendantsMin',
+    'at',
+  ] as const) {
+    const n = obj[k];
+    if (typeof n !== 'number' || !Number.isFinite(n) || n < 0) return false;
+  }
+  return true;
+}
+
+function isSyncState(x: unknown): x is SyncState {
+  if (typeof x !== 'object' || x === null) return false;
+  const obj = x as Record<string, unknown>;
+  if (
+    !Array.isArray(obj.pinned) ||
+    !Array.isArray(obj.favorite) ||
+    !Array.isArray(obj.hidden)
+  ) {
+    return false;
+  }
+  // Accept responses from older servers that don't yet return `done`
+  // as an array — treat it as empty rather than rejecting the pull.
+  // The POST path always sends `done`, and a fresh server deploy will
+  // start echoing it back.
+  if (obj.done !== undefined && !Array.isArray(obj.done)) return false;
+  // Drop a malformed avatar in place so the rest of the pipeline can
+  // treat it as "no record" without guarding every access. A bogus
+  // `at` would otherwise poison `lastPushedAvatar` via NaN.
+  if (obj.avatar !== undefined && !isSyncAvatar(obj.avatar)) {
+    delete obj.avatar;
+  }
+  // Same drop-in-place treatment for hotThresholds — a malformed record
+  // shouldn't reject the whole pull.
+  if (obj.hotThresholds !== undefined && !isSyncHotThresholds(obj.hotThresholds)) {
+    delete obj.hotThresholds;
+  }
+  return true;
+}
+
+function schedulePush(delayOverride?: number): void {
+  if (!runtime) return;
+  if (runtime.pushTimer) return;
+  const delay = delayOverride ?? runtime.debounceMs;
+  runtime.pushTimer = setTimeout(() => {
+    if (!runtime) return;
+    runtime.pushTimer = null;
+    void runPush();
+  }, delay);
+  notifyDebug();
+}
+
+async function runPush(opts: { keepalive?: boolean } = {}): Promise<void> {
+  if (!runtime) return;
+  const rt = runtime;
+  if (rt.pushInFlight) {
+    rt.pushQueued = true;
+    notifyDebug();
+    return;
+  }
+  rt.pushInFlight = true;
+  notifyDebug();
+  try {
+    await push(opts);
+  } finally {
+    // Identity check, not just null: a stop/start swap mid-push means
+    // the live runtime's flags are not ours to touch.
+    if (runtime === rt) {
+      rt.pushInFlight = false;
+      if (rt.pushQueued) {
+        rt.pushQueued = false;
+        schedulePush(0);
+      }
+      notifyDebug();
+    }
+  }
+}
+
+export interface StartOptions {
+  fetchImpl?: typeof fetch;
+  // Debounce window before a POST fires after a local change event.
+  // Tests override this to 0 so they don't need fake timers; default
+  // is the production 2-second debounce.
+  debounceMs?: number;
+}
+
+// Flush a pending debounced push right now, cancelling the timer. Used
+// when the tab is about to background or unload: a change made moments
+// earlier (e.g. marking a story done, which navigates the reader back to
+// the list) would otherwise sit in the ~2 s debounce window and be lost
+// if the browser freezes or discards the page before the timer fires.
+// No-op when nothing is scheduled — every tab-hide would otherwise kick
+// an empty POST.
+function flushPendingPush(): void {
+  if (!runtime) return;
+  const rt = runtime;
+  // Never start a second concurrent POST. `/api/sync` merges with a
+  // non-atomic get/merge/set, which is only safe because the client
+  // issues at most one POST at a time (the `pushInFlight` lock). Racing
+  // an unload flush against the in-flight request could let the older
+  // request's `set` land last and clobber the very edit we're trying to
+  // save. So when a POST is already in flight — or there's nothing
+  // pending — we do nothing here: the queued change stays in
+  // localStorage and flushes on the next change / reconnect / app open.
+  // It's never lost locally, just not guaranteed to reach the server
+  // before this particular unload.
+  //
+  // TODO(atomic-merge): closing that last window would need an atomic
+  // server-side merge (compare-and-set / Lua) so an overlapping keepalive
+  // flush is safe to fire. See TODO.md § "Atomic /api/sync merge".
+  if (rt.pushInFlight || !rt.pushTimer) return;
+  clearTimeout(rt.pushTimer);
+  rt.pushTimer = null;
+  // keepalive so the request survives the page being frozen/discarded;
+  // an oversized delta falls back to a normal POST inside push().
+  void runPush({ keepalive: true });
+}
+
+// Wire a document.visibilitychange listener that (a) flushes any pending
+// push the instant the tab hides, and (b) calls pull() when the tab
+// transitions back to visible, gated so rapid tab-switching doesn't
+// flood /api/sync. A pagehide listener covers unload / bfcache paths
+// where visibilitychange may not fire (notably iOS Safari). Lives inside
+// the runtime so stopCloudSync tears it down cleanly.
+function subscribeVisibility(): () => void {
+  if (typeof document === 'undefined') return () => {};
+  const handler = () => {
+    if (!runtime) return;
+    if (document.visibilityState !== 'visible') {
+      // Hidden: the page may be frozen or reclaimed next — get whatever
+      // just changed to the server before that can happen.
+      flushPendingPush();
+      return;
+    }
+    const now = Date.now();
+    if (now - runtime.lastPullAttemptAt < VISIBILITY_PULL_MIN_INTERVAL_MS) {
+      return;
+    }
+    void pull().then(() => schedulePush(0));
+  };
+  const pagehideHandler = () => flushPendingPush();
+  document.addEventListener('visibilitychange', handler);
+  window.addEventListener('pagehide', pagehideHandler);
+  return () => {
+    document.removeEventListener('visibilitychange', handler);
+    window.removeEventListener('pagehide', pagehideHandler);
+  };
+}
+
+export async function startCloudSync(
+  username: string,
+  opts: StartOptions = {},
+): Promise<void> {
+  if (runtime && runtime.username === username) return;
+  stopCloudSync();
+  // Read before the bump below: at boot nothing has started or stopped
+  // yet, so this is the generation the prime was fired under and the
+  // primed snapshot matches. After any earlier session it won't.
+  const generationBefore = syncGeneration;
+  syncGeneration += 1;
+
+  const fetchImpl = opts.fetchImpl ?? trackedFetch;
+  const onChange = () => schedulePush();
+
+  const rt: SyncRuntime = {
+    username,
+    lastPushed: { pinned: 0, favorite: 0, hidden: 0, done: 0 },
+    lastPushedAvatar: 0,
+    lastPushedHotThresholds: 0,
+    pushTimer: null,
+    pushInFlight: false,
+    pushQueued: false,
+    unsubscribeOnline: null,
+    unsubscribeVisibility: null,
+    onChange,
+    fetchImpl,
+    debounceMs: opts.debounceMs ?? SYNC_DEBOUNCE_MS,
+    lastPullAttemptAt: 0,
+  };
+  runtime = rt;
+
+  window.addEventListener(PINNED_STORIES_CHANGE_EVENT, onChange);
+  window.addEventListener(FAVORITES_CHANGE_EVENT, onChange);
+  window.addEventListener(HIDDEN_STORIES_CHANGE_EVENT, onChange);
+  window.addEventListener(DONE_STORIES_CHANGE_EVENT, onChange);
+  window.addEventListener(AVATAR_PREFS_CHANGE_EVENT, onChange);
+  window.addEventListener(HOT_THRESHOLDS_CHANGE_EVENT, onChange);
+
+  rt.unsubscribeOnline = subscribeOnline((online) => {
+    if (!online) return;
+    // Re-pull on reconnect and flush any deltas accumulated offline.
+    void pull().then(() => schedulePush(0));
+  });
+  rt.unsubscribeVisibility = subscribeVisibility();
+
+  notifyDebug();
+  await initialPull(rt, generationBefore);
+  // After pull, push any local changes that the server didn't already
+  // know about. Uses delay=0 rather than the debounce so a fresh
+  // login doesn't sit idle for 2 s before flushing.
+  schedulePush(0);
+}
+
+export function stopCloudSync(): void {
+  if (!runtime) return;
+  const r = runtime;
+  runtime = null;
+  // A real sign-out or user switch — the boot-time no-op call (auth not
+  // resolved yet, no runtime) returns above without bumping, so it can't
+  // invalidate the prime it's racing.
+  syncGeneration += 1;
+  window.removeEventListener(PINNED_STORIES_CHANGE_EVENT, r.onChange);
+  window.removeEventListener(FAVORITES_CHANGE_EVENT, r.onChange);
+  window.removeEventListener(HIDDEN_STORIES_CHANGE_EVENT, r.onChange);
+  window.removeEventListener(DONE_STORIES_CHANGE_EVENT, r.onChange);
+  window.removeEventListener(AVATAR_PREFS_CHANGE_EVENT, r.onChange);
+  window.removeEventListener(HOT_THRESHOLDS_CHANGE_EVENT, r.onChange);
+  if (r.pushTimer) clearTimeout(r.pushTimer);
+  r.unsubscribeOnline?.();
+  r.unsubscribeVisibility?.();
+  notifyDebug();
+}
+
+// Force an immediate GET /api/sync and merge the response. Used by
+// pull-to-refresh and the /debug "Pull now" button. No-op when sync
+// isn't running (user isn't signed in) — callers can always invoke
+// without checking auth state.
+export async function pullNow(): Promise<void> {
+  if (!runtime) return;
+  await pull();
+}
+
+// Force an immediate POST /api/sync of whatever delta is pending. If
+// nothing's pending the call completes without sending anything. Used
+// by the /debug "Push now" button.
+export async function pushNow(): Promise<void> {
+  if (!runtime) return;
+  if (runtime.pushTimer) {
+    clearTimeout(runtime.pushTimer);
+    runtime.pushTimer = null;
+  }
+  await runPush();
+}
+
+export function getCloudSyncDebug(): CloudSyncDebugSnapshot {
+  if (!runtime) {
+    return {
+      running: false,
+      username: null,
+      lastPushed: { pinned: 0, favorite: 0, hidden: 0, done: 0 },
+      lastPushedAvatar: 0,
+      lastPushedHotThresholds: 0,
+      pendingCount: { pinned: 0, favorite: 0, hidden: 0, done: 0 },
+      pendingAvatar: false,
+      pendingHotThresholds: false,
+      push: { inFlight: false, queued: false, timerPending: false },
+      lastPull,
+      lastPush,
+      lastHintFailure,
+    };
+  }
+  const delta = collectDelta();
+  return {
+    running: true,
+    username: runtime.username,
+    lastPushed: { ...runtime.lastPushed },
+    lastPushedAvatar: runtime.lastPushedAvatar,
+    lastPushedHotThresholds: runtime.lastPushedHotThresholds,
+    pendingCount: {
+      pinned: delta.pinned.length,
+      favorite: delta.favorite.length,
+      hidden: delta.hidden.length,
+      done: delta.done.length,
+    },
+    pendingAvatar: !!delta.avatar,
+    pendingHotThresholds: !!delta.hotThresholds,
+    push: {
+      inFlight: runtime.pushInFlight,
+      queued: runtime.pushQueued,
+      timerPending: runtime.pushTimer !== null,
+    },
+    lastPull,
+    lastPush,
+    lastHintFailure,
+  };
+}
+
+// Subscribe to snapshot changes. Fires on pull/push completion, push
+// state transitions (in-flight, queued), and start/stop. Callers are
+// expected to re-read the snapshot via getCloudSyncDebug(). Returns an
+// unsubscribe function.
+export function subscribeCloudSyncDebug(listener: () => void): () => void {
+  debugSubscribers.add(listener);
+  return () => {
+    debugSubscribers.delete(listener);
+  };
+}
+
+// Test-only peek at the singleton so tests can assert on internal
+// state transitions without exporting every mutable field.
+export function _getCloudSyncRuntimeForTests(): Readonly<SyncRuntime> | null {
+  return runtime;
+}
+
+// Test-only: yield microtasks so pending promise chains (pull/push
+// handlers) settle. Does NOT advance timers — tests must drive the
+// debounce with vi.advanceTimersByTimeAsync themselves. A generous
+// fixed budget of microtask yields is plenty for the 2–3 awaits our
+// push/pull chains do.
+export async function _flushCloudSyncForTests(): Promise<void> {
+  for (let i = 0; i < 20; i++) {
+    await Promise.resolve();
+  }
+}
+
+// Test-only: reset the stored lastPull / lastPush snapshots so tests
+// that inspect them don't see leftovers from earlier cases.
+export function _resetCloudSyncDebugForTests(): void {
+  lastPull = null;
+  lastPush = null;
+  lastHintFailure = null;
+  debugSubscribers.clear();
+}
+
+export function _resetCloudSyncPrimeForTests(): void {
+  primedPull = null;
+}

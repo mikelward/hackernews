@@ -1,0 +1,849 @@
+// @vitest-environment node
+import { beforeEach, describe, expect, it } from 'vitest';
+import {
+  handleSyncRequest,
+  mergeAvatar,
+  mergeEntries,
+  mergeHotThresholds,
+  type SyncAvatar,
+  type SyncEntry,
+  type SyncHotThresholds,
+  type SyncState,
+  type SyncStore,
+  _internals,
+} from './sync';
+
+const DEFAULT_HOT: SyncHotThresholds = {
+  topEnabled: true,
+  topScoreMin: 200,
+  topDescendantsMin: 100,
+  newEnabled: true,
+  newVelocityMin: 15,
+  newDescendantsMin: 10,
+  at: 1000,
+};
+
+const COOKIE = 'hn_session=alice%26hash';
+const UNAUTH_COOKIE = 'hn_session=a'; // too short → rejected
+const OTHER_USER_COOKIE = 'hn_session=bob%26hash';
+
+function request(
+  method: 'GET' | 'POST' | 'PUT',
+  body?: unknown,
+  cookie: string | null = COOKIE,
+): Request {
+  const headers = new Headers();
+  if (cookie !== null) headers.set('cookie', cookie);
+  if (body !== undefined) headers.set('content-type', 'application/json');
+  return new Request('https://newshacker.app/api/sync', {
+    method,
+    headers,
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+}
+
+function emptyState(): SyncState {
+  return { pinned: [], favorite: [], hidden: [], done: [] };
+}
+
+function createTestStore(): SyncStore & {
+  map: Map<string, SyncState>;
+  failGet: boolean;
+  failSet: boolean;
+} {
+  const map = new Map<string, SyncState>();
+  const state = { failGet: false, failSet: false };
+  return {
+    map,
+    get failGet() {
+      return state.failGet;
+    },
+    set failGet(v) {
+      state.failGet = v;
+    },
+    get failSet() {
+      return state.failSet;
+    },
+    set failSet(v) {
+      state.failSet = v;
+    },
+    async get(username) {
+      if (state.failGet) throw new Error('boom');
+      return map.get(username) ?? emptyState();
+    },
+    async set(username, s) {
+      if (state.failSet) throw new Error('boom');
+      map.set(username, s);
+    },
+  };
+}
+
+describe('mergeEntries', () => {
+  it('merges disjoint id sets', () => {
+    const merged = mergeEntries(
+      [{ id: 1, at: 100 }],
+      [{ id: 2, at: 200 }],
+    );
+    expect(merged).toEqual([
+      { id: 1, at: 100 },
+      { id: 2, at: 200 },
+    ]);
+  });
+
+  it('newer at wins per id', () => {
+    const merged = mergeEntries(
+      [{ id: 1, at: 100 }],
+      [{ id: 1, at: 200 }],
+    );
+    expect(merged).toEqual([{ id: 1, at: 200 }]);
+  });
+
+  it('older at loses per id', () => {
+    const merged = mergeEntries(
+      [{ id: 1, at: 500 }],
+      [{ id: 1, at: 100 }],
+    );
+    expect(merged).toEqual([{ id: 1, at: 500 }]);
+  });
+
+  it('ties keep the incumbent (idempotent repeat push)', () => {
+    const current: SyncEntry[] = [{ id: 1, at: 100 }];
+    const incoming: SyncEntry[] = [{ id: 1, at: 100 }];
+    const merged = mergeEntries(current, incoming);
+    expect(merged).toEqual([{ id: 1, at: 100 }]);
+  });
+
+  it('tombstone with newer at masks older additive', () => {
+    const merged = mergeEntries(
+      [{ id: 1, at: 100 }],
+      [{ id: 1, at: 200, deleted: true }],
+    );
+    expect(merged).toEqual([{ id: 1, at: 200, deleted: true }]);
+  });
+
+  it('additive with newer at resurrects an older tombstone', () => {
+    const merged = mergeEntries(
+      [{ id: 1, at: 100, deleted: true }],
+      [{ id: 1, at: 200 }],
+    );
+    expect(merged).toEqual([{ id: 1, at: 200 }]);
+  });
+});
+
+describe('mergeAvatar', () => {
+  it('returns incoming when current is absent', () => {
+    const next: SyncAvatar = { source: 'github', at: 100 };
+    expect(mergeAvatar(undefined, next)).toEqual(next);
+  });
+
+  it('returns current when incoming is absent', () => {
+    const cur: SyncAvatar = { source: 'github', at: 100 };
+    expect(mergeAvatar(cur, undefined)).toEqual(cur);
+  });
+
+  it('newer `at` wins', () => {
+    const cur: SyncAvatar = { source: 'github', at: 100 };
+    const next: SyncAvatar = { source: 'gravatar', at: 200, gravatarHash: 'a'.repeat(64) };
+    expect(mergeAvatar(cur, next)).toEqual(next);
+  });
+
+  it('older `at` loses', () => {
+    const cur: SyncAvatar = { source: 'github', at: 500 };
+    const next: SyncAvatar = { source: 'none', at: 100 };
+    expect(mergeAvatar(cur, next)).toEqual(cur);
+  });
+
+  it('ties keep the incumbent', () => {
+    const cur: SyncAvatar = { source: 'github', at: 100 };
+    const next: SyncAvatar = { source: 'none', at: 100 };
+    expect(mergeAvatar(cur, next)).toEqual(cur);
+  });
+});
+
+describe('normalizeAvatar', () => {
+  it('accepts a minimal record', () => {
+    expect(
+      _internals.normalizeAvatar({ source: 'github', at: 100 }),
+    ).toEqual({ source: 'github', at: 100 });
+  });
+
+  it('accepts github override', () => {
+    expect(
+      _internals.normalizeAvatar({
+        source: 'github',
+        githubUsername: 'alice-real',
+        at: 100,
+      }),
+    ).toEqual({ source: 'github', githubUsername: 'alice-real', at: 100 });
+  });
+
+  it('accepts gravatar hash', () => {
+    const hash = 'a'.repeat(64);
+    expect(
+      _internals.normalizeAvatar({
+        source: 'gravatar',
+        gravatarHash: hash,
+        at: 100,
+      }),
+    ).toEqual({ source: 'gravatar', gravatarHash: hash, at: 100 });
+  });
+
+  it('drops invalid github username but keeps the rest', () => {
+    expect(
+      _internals.normalizeAvatar({
+        source: 'github',
+        githubUsername: 'has space',
+        at: 100,
+      }),
+    ).toEqual({ source: 'github', at: 100 });
+  });
+
+  it('drops invalid hash but keeps the rest', () => {
+    expect(
+      _internals.normalizeAvatar({
+        source: 'gravatar',
+        gravatarHash: 'nothex',
+        at: 100,
+      }),
+    ).toEqual({ source: 'gravatar', at: 100 });
+  });
+
+  it('rejects unknown source', () => {
+    expect(
+      _internals.normalizeAvatar({ source: 'linkedin', at: 100 }),
+    ).toBeUndefined();
+  });
+
+  it('rejects a bogus `at`', () => {
+    expect(
+      _internals.normalizeAvatar({ source: 'github', at: 'soon' }),
+    ).toBeUndefined();
+    expect(
+      _internals.normalizeAvatar({ source: 'github', at: -1 }),
+    ).toBeUndefined();
+    expect(_internals.normalizeAvatar({ source: 'github' })).toBeUndefined();
+  });
+
+  it('never returns a raw email, even when one is provided', () => {
+    const result = _internals.normalizeAvatar({
+      source: 'gravatar',
+      gravatarEmail: 'alice@example.com',
+      gravatarHash: 'a'.repeat(64),
+      at: 100,
+    });
+    expect(result).toBeDefined();
+    expect(result).not.toHaveProperty('gravatarEmail');
+  });
+});
+
+describe('mergeHotThresholds', () => {
+  it('returns incoming when current is absent', () => {
+    expect(mergeHotThresholds(undefined, DEFAULT_HOT)).toEqual(DEFAULT_HOT);
+  });
+
+  it('returns current when incoming is absent', () => {
+    expect(mergeHotThresholds(DEFAULT_HOT, undefined)).toEqual(DEFAULT_HOT);
+  });
+
+  it('newer `at` wins', () => {
+    const next: SyncHotThresholds = {
+      ...DEFAULT_HOT,
+      topEnabled: false,
+      at: 2000,
+    };
+    expect(mergeHotThresholds(DEFAULT_HOT, next)).toEqual(next);
+  });
+
+  it('older `at` loses', () => {
+    const next: SyncHotThresholds = {
+      ...DEFAULT_HOT,
+      topEnabled: false,
+      at: 500,
+    };
+    expect(mergeHotThresholds(DEFAULT_HOT, next)).toEqual(DEFAULT_HOT);
+  });
+
+  it('ties keep the incumbent (idempotent push)', () => {
+    const next: SyncHotThresholds = {
+      ...DEFAULT_HOT,
+      topEnabled: false,
+      at: 1000,
+    };
+    expect(mergeHotThresholds(DEFAULT_HOT, next)).toEqual(DEFAULT_HOT);
+  });
+});
+
+describe('normalizeHotThresholds', () => {
+  it('accepts a complete record', () => {
+    expect(_internals.normalizeHotThresholds(DEFAULT_HOT)).toEqual(DEFAULT_HOT);
+  });
+
+  it('rounds non-integer numbers', () => {
+    const result = _internals.normalizeHotThresholds({
+      ...DEFAULT_HOT,
+      topScoreMin: 200.7,
+      newVelocityMin: 14.2,
+    });
+    expect(result?.topScoreMin).toBe(201);
+    expect(result?.newVelocityMin).toBe(14);
+  });
+
+  it('rejects a non-boolean enabled flag', () => {
+    expect(
+      _internals.normalizeHotThresholds({ ...DEFAULT_HOT, topEnabled: 'yes' }),
+    ).toBeUndefined();
+  });
+
+  it('rejects a negative threshold value', () => {
+    expect(
+      _internals.normalizeHotThresholds({ ...DEFAULT_HOT, topScoreMin: -5 }),
+    ).toBeUndefined();
+  });
+
+  it('rejects a missing `at`', () => {
+    const { at: _at, ...rest } = DEFAULT_HOT;
+    void _at;
+    expect(_internals.normalizeHotThresholds(rest)).toBeUndefined();
+  });
+
+  it('rejects a non-numeric `at`', () => {
+    expect(
+      _internals.normalizeHotThresholds({ ...DEFAULT_HOT, at: 'soon' }),
+    ).toBeUndefined();
+  });
+
+  it('rejects null / non-object input', () => {
+    expect(_internals.normalizeHotThresholds(null)).toBeUndefined();
+    expect(_internals.normalizeHotThresholds('hello')).toBeUndefined();
+  });
+});
+
+describe('handleSyncRequest auth', () => {
+  it('returns 401 without a cookie', async () => {
+    const store = createTestStore();
+    const res = await handleSyncRequest(request('GET', undefined, null), {
+      store,
+    });
+    expect(res.status).toBe(401);
+  });
+
+  it('returns 401 with a malformed session cookie', async () => {
+    const store = createTestStore();
+    const res = await handleSyncRequest(
+      request('GET', undefined, UNAUTH_COOKIE),
+      { store },
+    );
+    expect(res.status).toBe(401);
+  });
+
+  it('returns 405 for unsupported methods', async () => {
+    const store = createTestStore();
+    const res = await handleSyncRequest(request('PUT'), { store });
+    expect(res.status).toBe(405);
+  });
+
+  it('returns 503 when the store is not configured', async () => {
+    const res = await handleSyncRequest(request('GET'), { store: null });
+    expect(res.status).toBe(503);
+  });
+});
+
+describe('handleSyncRequest bearer-token auth (companion app)', () => {
+  const TOKEN = 'nht_companiontokenvalue';
+
+  function bearerRequest(
+    method: 'GET' | 'POST',
+    body?: unknown,
+    auth: string | null = `Bearer ${TOKEN}`,
+  ): Request {
+    const headers = new Headers();
+    if (auth !== null) headers.set('authorization', auth);
+    if (body !== undefined) headers.set('content-type', 'application/json');
+    // No cookie — this is the server-to-server companion path.
+    return new Request('https://newshacker.app/api/sync', {
+      method,
+      headers,
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+  }
+
+  // Resolver that only knows the one valid token, mapping it to `alice`.
+  const resolveToken = async (raw: string) =>
+    raw === TOKEN ? 'alice' : null;
+
+  it('authenticates a valid bearer token as its owner and writes their list', async () => {
+    const store = createTestStore();
+    const res = await handleSyncRequest(
+      bearerRequest('POST', { done: [{ id: 42, at: 5 }] }),
+      { store, resolveToken },
+    );
+    expect(res.status).toBe(200);
+    const state = (await res.json()) as SyncState;
+    expect(state.done).toEqual([{ id: 42, at: 5 }]);
+    // The write landed under the token owner's username.
+    expect(store.map.get('alice')?.done).toEqual([{ id: 42, at: 5 }]);
+  });
+
+  it('rejects an unknown/revoked token with 401', async () => {
+    const store = createTestStore();
+    const res = await handleSyncRequest(
+      bearerRequest('GET', undefined, 'Bearer nht_revoked'),
+      { store, resolveToken },
+    );
+    expect(res.status).toBe(401);
+  });
+
+  it('ignores a bearer header without the app-token prefix', async () => {
+    const store = createTestStore();
+    const res = await handleSyncRequest(
+      bearerRequest('GET', undefined, 'Bearer some-other-jwt'),
+      { store, resolveToken },
+    );
+    expect(res.status).toBe(401);
+  });
+
+  it('a valid cookie takes precedence over a bearer token', async () => {
+    const store = createTestStore();
+    // Cookie says alice; bearer would resolve to bob — cookie must win.
+    const headers = new Headers();
+    headers.set('cookie', COOKIE); // alice
+    headers.set('authorization', 'Bearer nht_bobs');
+    headers.set('content-type', 'application/json');
+    const req = new Request('https://newshacker.app/api/sync', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ done: [{ id: 1, at: 1 }] }),
+    });
+    const res = await handleSyncRequest(req, {
+      store,
+      resolveToken: async () => 'bob',
+    });
+    expect(res.status).toBe(200);
+    expect(store.map.get('alice')?.done).toEqual([{ id: 1, at: 1 }]);
+    expect(store.map.has('bob')).toBe(false);
+  });
+
+  it('bearer path is disabled when no resolver is configured', async () => {
+    const store = createTestStore();
+    const res = await handleSyncRequest(bearerRequest('GET'), {
+      store,
+      resolveToken: null,
+    });
+    expect(res.status).toBe(401);
+  });
+});
+
+describe('handleSyncRequest GET', () => {
+  let store: ReturnType<typeof createTestStore>;
+  beforeEach(() => {
+    store = createTestStore();
+  });
+
+  it('returns empty lists for a new user', async () => {
+    const res = await handleSyncRequest(request('GET'), { store });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      pinned: [],
+      favorite: [],
+      hidden: [],
+      done: [],
+    });
+  });
+
+  it('returns the user’s stored state', async () => {
+    store.map.set('alice', {
+      pinned: [{ id: 1, at: 100 }],
+      favorite: [{ id: 2, at: 200 }],
+      hidden: [{ id: 3, at: 300 }],
+      done: [{ id: 4, at: 400 }],
+    });
+    const res = await handleSyncRequest(request('GET'), { store });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      pinned: [{ id: 1, at: 100 }],
+      favorite: [{ id: 2, at: 200 }],
+      hidden: [{ id: 3, at: 300 }],
+      done: [{ id: 4, at: 400 }],
+    });
+  });
+
+  it('isolates users', async () => {
+    store.map.set('bob', {
+      pinned: [{ id: 99, at: 9999 }],
+      favorite: [],
+      hidden: [],
+      done: [],
+    });
+    const res = await handleSyncRequest(request('GET'), { store });
+    const body = (await res.json()) as SyncState;
+    expect(body.pinned).toEqual([]);
+
+    const resBob = await handleSyncRequest(
+      request('GET', undefined, OTHER_USER_COOKIE),
+      { store },
+    );
+    const bobBody = (await resBob.json()) as SyncState;
+    expect(bobBody.pinned).toEqual([{ id: 99, at: 9999 }]);
+  });
+
+  it('fails open with empty state when the store throws', async () => {
+    store.failGet = true;
+    const res = await handleSyncRequest(request('GET'), { store });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      pinned: [],
+      favorite: [],
+      hidden: [],
+      done: [],
+    });
+  });
+});
+
+describe('handleSyncRequest POST', () => {
+  let store: ReturnType<typeof createTestStore>;
+  beforeEach(() => {
+    store = createTestStore();
+  });
+
+  it('round-trips a delta', async () => {
+    const res = await handleSyncRequest(
+      request('POST', {
+        pinned: [{ id: 10, at: 1000 }],
+        favorite: [{ id: 20, at: 2000 }],
+        hidden: [{ id: 30, at: 3000 }],
+        done: [{ id: 40, at: 4000 }],
+      }),
+      { store },
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as SyncState;
+    expect(body).toEqual({
+      pinned: [{ id: 10, at: 1000 }],
+      favorite: [{ id: 20, at: 2000 }],
+      hidden: [{ id: 30, at: 3000 }],
+      done: [{ id: 40, at: 4000 }],
+    });
+    expect(store.map.get('alice')).toEqual(body);
+
+    const getRes = await handleSyncRequest(request('GET'), { store });
+    expect(await getRes.json()).toEqual(body);
+  });
+
+  it('merges a later delta on top of earlier state', async () => {
+    store.map.set('alice', {
+      pinned: [
+        { id: 1, at: 100 },
+        { id: 2, at: 200 },
+      ],
+      favorite: [],
+      hidden: [],
+      done: [],
+    });
+    const res = await handleSyncRequest(
+      request('POST', {
+        pinned: [{ id: 2, at: 250 }, { id: 3, at: 300 }],
+      }),
+      { store },
+    );
+    const body = (await res.json()) as SyncState;
+    expect(body.pinned).toEqual([
+      { id: 1, at: 100 },
+      { id: 2, at: 250 },
+      { id: 3, at: 300 },
+    ]);
+  });
+
+  it('honours per-id last-write-wins across pushes', async () => {
+    store.map.set('alice', {
+      pinned: [{ id: 1, at: 500 }],
+      favorite: [],
+      hidden: [],
+      done: [],
+    });
+    const res = await handleSyncRequest(
+      request('POST', { pinned: [{ id: 1, at: 100 }] }),
+      { store },
+    );
+    const body = (await res.json()) as SyncState;
+    expect(body.pinned).toEqual([{ id: 1, at: 500 }]);
+  });
+
+  it('tombstones mask older additive entries', async () => {
+    store.map.set('alice', {
+      pinned: [{ id: 1, at: 100 }],
+      favorite: [],
+      hidden: [],
+      done: [],
+    });
+    const res = await handleSyncRequest(
+      request('POST', {
+        pinned: [{ id: 1, at: 200, deleted: true }],
+      }),
+      { store },
+    );
+    const body = (await res.json()) as SyncState;
+    expect(body.pinned).toEqual([{ id: 1, at: 200, deleted: true }]);
+  });
+
+  it('rejects entries with bogus shape while keeping valid ones', async () => {
+    const res = await handleSyncRequest(
+      request('POST', {
+        pinned: [
+          { id: 1, at: 100 },
+          { id: -1, at: 100 }, // bad id
+          { id: 2, at: 'soon' }, // bad at
+          { id: 3, at: 300, deleted: 'yes' }, // bad deleted
+          'garbage',
+          { id: 4, at: 400 },
+        ],
+      }),
+      { store },
+    );
+    const body = (await res.json()) as SyncState;
+    expect(body.pinned).toEqual([
+      { id: 1, at: 100 },
+      { id: 4, at: 400 },
+    ]);
+  });
+
+  it('returns 400 on non-JSON body', async () => {
+    const req = new Request('https://newshacker.app/api/sync', {
+      method: 'POST',
+      headers: { cookie: COOKIE, 'content-type': 'application/json' },
+      body: 'not json',
+    });
+    const res = await handleSyncRequest(req, { store });
+    expect(res.status).toBe(400);
+  });
+
+  it('returns 400 when body is not an object', async () => {
+    const res = await handleSyncRequest(request('POST', [1, 2, 3]), {
+      store,
+    });
+    expect(res.status).toBe(400);
+  });
+
+  it('returns 413 when content-length exceeds the limit', async () => {
+    const headers = new Headers({
+      cookie: COOKIE,
+      'content-type': 'application/json',
+      'content-length': String(_internals.MAX_BODY_BYTES + 1),
+    });
+    const res = await handleSyncRequest(
+      new Request('https://newshacker.app/api/sync', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ pinned: [] }),
+      }),
+      { store },
+    );
+    expect(res.status).toBe(413);
+  });
+
+  it('caps oversized lists to the most recent entries', async () => {
+    const bigList: SyncEntry[] = [];
+    for (let i = 1; i <= _internals.MAX_ENTRIES_PER_LIST + 5; i++) {
+      bigList.push({ id: i, at: i });
+    }
+    const res = await handleSyncRequest(
+      request('POST', { pinned: bigList }),
+      { store },
+    );
+    const body = (await res.json()) as SyncState;
+    expect(body.pinned).toHaveLength(_internals.MAX_ENTRIES_PER_LIST);
+    // Most-recent-at kept: the 5 smallest `at` were dropped.
+    expect(body.pinned[0].id).toBe(6);
+  });
+
+  it('returns 503 if the store fails on GET during POST', async () => {
+    store.failGet = true;
+    const res = await handleSyncRequest(
+      request('POST', { pinned: [{ id: 1, at: 100 }] }),
+      { store },
+    );
+    expect(res.status).toBe(503);
+  });
+
+  it('returns 503 if the store fails on SET', async () => {
+    store.failSet = true;
+    const res = await handleSyncRequest(
+      request('POST', { pinned: [{ id: 1, at: 100 }] }),
+      { store },
+    );
+    expect(res.status).toBe(503);
+  });
+
+  it('accepts an empty body (no-op push)', async () => {
+    store.map.set('alice', {
+      pinned: [{ id: 1, at: 100 }],
+      favorite: [],
+      hidden: [],
+      done: [],
+    });
+    const res = await handleSyncRequest(request('POST', {}), { store });
+    const body = (await res.json()) as SyncState;
+    expect(body.pinned).toEqual([{ id: 1, at: 100 }]);
+  });
+
+  it('round-trips a done delta independent of the other lists', async () => {
+    const res = await handleSyncRequest(
+      request('POST', {
+        done: [
+          { id: 1, at: 100 },
+          { id: 2, at: 200, deleted: true },
+        ],
+      }),
+      { store },
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as SyncState;
+    expect(body.done).toEqual([
+      { id: 1, at: 100 },
+      { id: 2, at: 200, deleted: true },
+    ]);
+    expect(body.pinned).toEqual([]);
+    expect(body.favorite).toEqual([]);
+    expect(body.hidden).toEqual([]);
+  });
+
+  it('round-trips an avatar record and preserves it across pushes', async () => {
+    const res = await handleSyncRequest(
+      request('POST', {
+        avatar: { source: 'github', githubUsername: 'alice-real', at: 100 },
+      }),
+      { store },
+    );
+    const body = (await res.json()) as SyncState;
+    expect(body.avatar).toEqual({
+      source: 'github',
+      githubUsername: 'alice-real',
+      at: 100,
+    });
+
+    // A later push with no avatar keeps the stored record.
+    const res2 = await handleSyncRequest(
+      request('POST', { pinned: [{ id: 1, at: 200 }] }),
+      { store },
+    );
+    const body2 = (await res2.json()) as SyncState;
+    expect(body2.avatar).toEqual({
+      source: 'github',
+      githubUsername: 'alice-real',
+      at: 100,
+    });
+  });
+
+  it('applies LWW on the avatar across pushes', async () => {
+    await handleSyncRequest(
+      request('POST', { avatar: { source: 'github', at: 500 } }),
+      { store },
+    );
+    // Older push loses.
+    const losing = await handleSyncRequest(
+      request('POST', { avatar: { source: 'none', at: 100 } }),
+      { store },
+    );
+    expect(((await losing.json()) as SyncState).avatar?.source).toBe('github');
+    // Newer push wins.
+    const winning = await handleSyncRequest(
+      request('POST', {
+        avatar: { source: 'gravatar', gravatarHash: 'a'.repeat(64), at: 900 },
+      }),
+      { store },
+    );
+    const body = (await winning.json()) as SyncState;
+    expect(body.avatar).toEqual({
+      source: 'gravatar',
+      gravatarHash: 'a'.repeat(64),
+      at: 900,
+    });
+  });
+
+  it('strips a raw gravatarEmail from an incoming avatar', async () => {
+    const res = await handleSyncRequest(
+      request('POST', {
+        avatar: {
+          source: 'gravatar',
+          gravatarEmail: 'alice@example.com',
+          gravatarHash: 'a'.repeat(64),
+          at: 100,
+        },
+      }),
+      { store },
+    );
+    const body = (await res.json()) as SyncState;
+    expect(body.avatar).toBeDefined();
+    expect(body.avatar).not.toHaveProperty('gravatarEmail');
+    expect(store.map.get('alice')?.avatar).not.toHaveProperty('gravatarEmail');
+  });
+
+  it('silently ignores a malformed avatar (keeps the rest of the delta)', async () => {
+    const res = await handleSyncRequest(
+      request('POST', {
+        pinned: [{ id: 1, at: 100 }],
+        avatar: { source: 'linkedin', at: 100 },
+      }),
+      { store },
+    );
+    const body = (await res.json()) as SyncState;
+    expect(body.pinned).toEqual([{ id: 1, at: 100 }]);
+    expect(body.avatar).toBeUndefined();
+  });
+
+  it('round-trips a hotThresholds record and preserves it across pushes', async () => {
+    const res = await handleSyncRequest(
+      request('POST', { hotThresholds: DEFAULT_HOT }),
+      { store },
+    );
+    const body = (await res.json()) as SyncState;
+    expect(body.hotThresholds).toEqual(DEFAULT_HOT);
+
+    // A later push with no hotThresholds keeps the stored record.
+    const res2 = await handleSyncRequest(
+      request('POST', { pinned: [{ id: 1, at: 200 }] }),
+      { store },
+    );
+    expect(((await res2.json()) as SyncState).hotThresholds).toEqual(DEFAULT_HOT);
+  });
+
+  it('applies LWW on hotThresholds across pushes', async () => {
+    await handleSyncRequest(
+      request('POST', { hotThresholds: { ...DEFAULT_HOT, at: 500 } }),
+      { store },
+    );
+    // Older push loses (server keeps the original).
+    const losing = await handleSyncRequest(
+      request('POST', {
+        hotThresholds: { ...DEFAULT_HOT, topEnabled: false, at: 100 },
+      }),
+      { store },
+    );
+    expect(
+      ((await losing.json()) as SyncState).hotThresholds?.topEnabled,
+    ).toBe(true);
+    // Newer push wins.
+    const winning = await handleSyncRequest(
+      request('POST', {
+        hotThresholds: { ...DEFAULT_HOT, topEnabled: false, at: 900 },
+      }),
+      { store },
+    );
+    expect(
+      ((await winning.json()) as SyncState).hotThresholds?.topEnabled,
+    ).toBe(false);
+  });
+
+  it('silently ignores a malformed hotThresholds (keeps the rest of the delta)', async () => {
+    const res = await handleSyncRequest(
+      request('POST', {
+        pinned: [{ id: 1, at: 100 }],
+        // Missing `at` → strict validator rejects the record outright.
+        hotThresholds: { ...DEFAULT_HOT, at: undefined },
+      }),
+      { store },
+    );
+    const body = (await res.json()) as SyncState;
+    expect(body.pinned).toEqual([{ id: 1, at: 100 }]);
+    expect(body.hotThresholds).toBeUndefined();
+  });
+});

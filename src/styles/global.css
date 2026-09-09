@@ -1,0 +1,350 @@
+:root {
+  --nh-orange: #ef5f00;
+  --nh-orange-dark: #e65c00;
+  --nh-bg: #f6f6ef;
+  --nh-meta: #828282;
+  /* Read / already-opened story color. Sits between --nh-meta and
+     --nh-text so an opened title is clearly less prominent than an
+     unread one but still readable — the previous shared --nh-meta
+     was too faded against the meta row below it. Nudged darker from
+     #5a5a5a so read-but-pinned rows read comfortably; unread stays
+     pure --nh-text and the weight gap keeps the two distinguishable. */
+  --nh-read: #4a4a4a;
+  --nh-border: #e0e0d9;
+  --nh-text: #000;
+  --nh-link: #000;
+  --nh-bg-card: #ffffff;
+  --nh-bg-code: #f4f4ee;
+  --nh-pressed: #ececec;
+  --skeleton-base: #f0f0f0;
+  --skeleton-highlight: #e4e4e4;
+  --tap-min: 48px;
+
+  /* Reading text size (drawer → Text size). The anchor for the rem-based
+     reading surfaces — story rows, comments, thread text — so the setting
+     scales what you read while px-sized chrome stays put. Medium (16px) is the
+     default and owns the bare :root; small/large override below. */
+  --nh-font-size: 16px;
+
+  /* Outer height of the sticky <AppHeader>. The header has no
+     declared height — its size is implied by the 48px (`--tap-min`)
+     menu button plus 4+4px of vertical padding (and a 1px bottom
+     border in `mono`/`duo` chromes; classic chrome drops the border
+     and replaces it with a box-shadow that doesn't take layout
+     space, so the height is 56px there). Pinning a token at 56px
+     lets `.list-toolbar` stick at `top: var(--app-header-height)`
+     without re-deriving the arithmetic in two CSS files — and the
+     1px slack in `mono`/`duo` is hidden by the header's higher
+     z-index. If the header's intrinsic height ever changes, update
+     this token in one place. */
+  --app-header-height: 56px;
+
+  /* Vertical gap between any two comment borders — the distance a
+     reader sees between the last visible element of one comment and
+     the border-top of the comment that follows. Used by .comment's
+     padding-bottom (sibling → sibling case) and .comment__children's
+     margin-top (parent → first-child case); those two rules MUST
+     share this value or the two transitions drift apart. Keeping
+     them in one token rather than two bare numbers is what makes the
+     invariant self-enforcing instead of prose-enforced. */
+  --comment-stack-gap: 4px;
+
+  /* Horizontal gutter on either side of every comment card. Used as
+     .comment's left/right padding AND — asymmetrically — as the
+     negative RIGHT margin on .comment__children so a nested reply
+     escapes the parent's right padding and reaches the thread's
+     right edge. The nested list's LEFT margin stays at 0 on purpose:
+     the parent's left padding is the intentional indent that signals
+     reply depth. Sharing this token between .comment's padding and
+     .comment__children's negative right margin keeps the "one gutter
+     per side of the column, regardless of depth" invariant
+     self-enforcing. */
+  --comment-gutter: 12px;
+
+  --font-system: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
+    'Helvetica Neue', Arial, sans-serif;
+  /* Bundled Roboto (see main.tsx) with the system stack as fallback for the
+     pre-font-load first paint and any environment that can't fetch the woff2. */
+  --font: 'Roboto Variable', var(--font-system);
+
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    --nh-bg: #1b1b17;
+    --nh-meta: #9a9a8c;
+    --nh-read: #d2d2c4;
+    --nh-border: #2f2f2a;
+    --nh-text: #ececea;
+    --nh-link: #ececea;
+    --nh-bg-card: #222220;
+    --nh-bg-code: #2a2a25;
+    --nh-pressed: #2a2a25;
+    --skeleton-base: #2a2a25;
+    --skeleton-highlight: #3a3a32;
+    color-scheme: dark;
+  }
+}
+
+:root[data-theme='dark'] {
+  --nh-bg: #1b1b17;
+  --nh-meta: #9a9a8c;
+  --nh-read: #d2d2c4;
+  --nh-border: #2f2f2a;
+  --nh-text: #ececea;
+  --nh-link: #ececea;
+  --nh-bg-card: #222220;
+  --nh-bg-code: #2a2a25;
+  --nh-pressed: #2a2a25;
+  --skeleton-base: #2a2a25;
+  --skeleton-highlight: #3a3a32;
+  color-scheme: dark;
+}
+
+/* ---------- Reset ----------
+   A small, opinionated reset so component CSS doesn't have to fight UA
+   defaults on every heading, list, button, and image. Anything specific
+   to newshacker (colors, fonts, focus ring) lives in the Base section
+   below. */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body,
+h1,
+h2,
+h3,
+h4,
+h5,
+h6,
+p,
+figure,
+blockquote,
+dl,
+dd {
+  margin: 0;
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  font-size: inherit;
+  font-weight: inherit;
+}
+
+img,
+picture,
+video,
+canvas,
+svg {
+  display: block;
+  max-width: 100%;
+}
+
+input,
+button,
+textarea,
+select {
+  font: inherit;
+  color: inherit;
+}
+
+button {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+}
+
+/* ---------- Base ---------- */
+
+/* Text-size scale. Overrides the --nh-font-size token the root font-size reads
+   below; 16px is the default and needs no attribute. One rung per value in
+   `FONT_SIZES` — a value with no rule here silently falls back to 16px while
+   the picker reports the size it thinks it set, so `global.css.test.ts` derives
+   this list from that array rather than trusting the two to be edited together. */
+:root[data-font-size='14'] {
+  --nh-font-size: 14px;
+}
+
+:root[data-font-size='15'] {
+  --nh-font-size: 15px;
+}
+
+:root[data-font-size='17'] {
+  --nh-font-size: 17px;
+}
+
+:root[data-font-size='18'] {
+  --nh-font-size: 18px;
+}
+
+:root[data-font-size='19'] {
+  --nh-font-size: 19px;
+}
+
+:root[data-font-size='20'] {
+  --nh-font-size: 20px;
+}
+
+:root[data-font-size='22'] {
+  --nh-font-size: 22px;
+}
+
+:root[data-font-size='24'] {
+  --nh-font-size: 24px;
+}
+
+:root[data-font-size='26'] {
+  --nh-font-size: 26px;
+}
+
+:root[data-font-size='28'] {
+  --nh-font-size: 28px;
+}
+
+:root[data-font-size='30'] {
+  --nh-font-size: 30px;
+}
+
+:root[data-font-size='32'] {
+  --nh-font-size: 32px;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+  /* Anchor `rem` to the chosen text size: the reading surfaces size their type
+     in `rem`, which resolves against the root, so the "Text size" setting moves
+     the root font-size to scale them. Chrome stays in px and is unaffected. */
+  font-size: var(--nh-font-size);
+}
+
+body {
+  min-height: 100dvh;
+  font-family: var(--font);
+  font-size: 1rem;
+  line-height: 1.4;
+  color: var(--nh-text);
+  background: var(--nh-bg);
+}
+
+a {
+  color: var(--nh-link);
+  text-decoration: none;
+}
+
+/* Sticky :hover on touch devices: only underline on true pointers. */
+@media (hover: hover) {
+  a:hover {
+    text-decoration: underline;
+  }
+}
+
+:focus-visible {
+  outline: 2px solid var(--nh-orange);
+  outline-offset: 2px;
+}
+
+.app-main {
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 0 0 calc(24px + env(safe-area-inset-bottom));
+}
+
+/* Desktop/large-tablet: give the reading column a little more room so a
+   1440+ monitor doesn't leave the layout feeling like a
+   phone-stretched-wide. 720→860 is ~20% wider; still a readable measure
+   at 16px body text (~120 characters per line is the upper end of
+   comfortable). Same cap for feed and thread — the feed at 860 is a
+   modest density improvement, and thread pages also benefit from the
+   wider reading column. The 960px threshold keeps iPad portrait (768)
+   at the original 720 layout and only kicks in at landscape tablets +
+   laptops. (The collapsed-comment clamp stayed at 3 lines — the wider
+   column already fits more characters per line, so the same clamp
+   surfaces more text on desktop without a second knob to tune. See
+   TODO.md § Desktop layout for relaxing the clamp as a follow-up.) */
+@media (min-width: 960px) {
+  .app-main {
+    max-width: 860px;
+  }
+}
+
+.page-message {
+  padding: 16px;
+}
+
+.page-message p + p {
+  margin-top: 12px;
+}
+
+.retry-btn {
+  background: var(--nh-bg-card);
+  border: 1px solid var(--nh-border);
+  color: var(--nh-text);
+  padding: 10px 20px;
+  border-radius: 6px;
+  min-height: var(--tap-min);
+  min-width: 120px;
+  font-weight: 600;
+}
+
+@media (hover: hover) {
+  .retry-btn:hover {
+    background: var(--nh-pressed);
+  }
+}
+
+.retry-btn:active {
+  background: var(--nh-border);
+}
+
+/* Shared chunky action button — matches `.thread__action` in
+   Thread.css so buttons on library pages (/done, /opened, /hidden)
+   don't drift visually from the thread action bar. Keep in sync
+   with `.thread__action` until the two are unified. Includes
+   `text-decoration: none` so the class can be applied to `<a>` /
+   `<Link>` without picking up the global `a:hover` underline. */
+.nh-action-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 56px;
+  padding: 12px 16px;
+  background: var(--nh-bg-card);
+  border: 1px solid var(--nh-border);
+  border-radius: 8px;
+  color: var(--nh-text);
+  cursor: pointer;
+  text-decoration: none;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+@media (hover: hover) {
+  .nh-action-btn:hover {
+    background: var(--nh-pressed);
+    text-decoration: none;
+  }
+}
+
+.nh-action-btn:active {
+  background: var(--nh-border);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition: none !important;
+    animation: none !important;
+  }
+}

@@ -1,0 +1,530 @@
+.thread {
+  background: var(--nh-bg-card);
+}
+
+.thread__header {
+  padding: 16px 16px 8px;
+  border-bottom: 1px solid var(--nh-border);
+}
+
+/* Zero the last child's own margin-bottom so the gap between the
+   last in-header element (thread__meta, or thread__text on self
+   posts) and the header's border-bottom comes solely from the
+   header's padding-bottom — otherwise meta's 12px margin stacks
+   with the padding and the bottom gap balloons past what the other
+   top-level boxes use. Narrowed to meta/text on purpose: the
+   deleted/dead render path (Thread.tsx) puts just a thread__title
+   in the header, and that case should keep its declared 12px margin
+   rather than silently de-stacking here. */
+.thread__header > .thread__meta:last-child,
+.thread__header > .thread__text:last-child {
+  margin-bottom: 0;
+}
+
+.thread__title {
+  margin: 0 0 12px;
+  font-size: 1.25rem;
+  font-weight: 700;
+  line-height: 1.3;
+  color: var(--nh-text);
+}
+
+/* The title doubles as a secondary path to the article URL — "Read
+   article" stays the primary affordance, but a tap on the headline
+   itself also opens the link for readers who reach for it. Stays
+   styled as a heading (inherit color, no underline) so it reads as a
+   title at rest; lights up HN-orange on pointer hover and on press so
+   the affordance is visible without turning it into a blue link. The
+   :hover rule is gated behind (hover: hover) so the color doesn't
+   stick on touch devices after a tap (see CLAUDE.md § CSS gotchas);
+   :active stays outside so touch still gets the pressed-state flash. */
+.thread__title-link {
+  color: inherit;
+  text-decoration: none;
+}
+
+@media (hover: hover) {
+  .thread__title-link:hover {
+    color: var(--nh-orange);
+  }
+}
+
+.thread__title-link:active {
+  color: var(--nh-orange);
+}
+
+/* Single-row layout at every phone width. flex-wrap: wrap is retained
+   as a safety net for absurdly narrow viewports (<300px, no real
+   device), but the primary/stretch slot has `flex: 1; min-width: 0`
+   and its label truncates via `.thread__action-label` when space gets
+   tight — so Pin/Done/⋮ never get pushed to a second row on anything
+   the size of a real phone. See Thread.toolbarLayout.test.tsx for the
+   regression guard (an earlier design forced a wrap at ≤480px, which
+   broke in two ways: Pixel-10-class phones lost tap-target real
+   estate to a gratuitous 2-row layout, and the top/bottom bars
+   disagreed about whether to wrap whenever the two labels had
+   different natural widths). */
+.thread__actions {
+  display: flex;
+  flex-wrap: wrap;
+  /* Right-align the row so the icon buttons stay anchored to the right
+     edge. On URL-backed stories the primary/stretch slot's `flex: 1`
+     already consumes all the free space, so this is a no-op there; but
+     on Ask HN / self-posts there's no primary button, and without this
+     the icon buttons (Upvote/Pin/Done/⋮) would sit flush-left. The bar
+     should read the same either way — actions on the right. */
+  justify-content: flex-end;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.thread__action {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 44px;
+  padding: 8px 16px;
+  background: var(--nh-bg-card);
+  border: 1px solid var(--nh-border);
+  border-radius: 8px;
+  color: var(--nh-text);
+  cursor: pointer;
+  text-decoration: none;
+  /* Action control, not reading copy — stays px so the Text size setting
+     doesn't scale it (and risk truncating the single-row label). */
+  font-size: 16px;
+  font-weight: 600;
+}
+
+@media (hover: hover) {
+  .thread__action:hover {
+    background: var(--nh-pressed);
+    text-decoration: none;
+  }
+}
+
+.thread__action:active {
+  background: var(--nh-border);
+}
+
+.thread__action--primary {
+  flex: 1;
+  min-width: 0;
+  background: var(--nh-orange);
+  border-color: var(--nh-orange);
+  color: #fff;
+}
+
+/* Grows an action to fill the row's primary slot without inheriting
+   --primary's orange. The bottom bar's Back to top uses this so Pin/
+   Done/⋮ end up at the same x-position as their top-bar counterparts —
+   a reader's thumb learns one location instead of two. Shares
+   --primary's `flex: 1; min-width: 0` so the label ellipsis-truncates
+   rather than pushing the icon row onto a second row on phones. */
+.thread__action--stretch {
+  flex: 1;
+  min-width: 0;
+}
+
+/* Stacked on --primary after the article has been opened once. Keeps the
+   layout of the primary button (flex: 1, min-width: 0) but drops the HN
+   orange down to the neutral secondary palette, so a re-visit to the
+   same thread doesn't keep shouting "read this!" at a reader who
+   already has. The rules below override the --primary declarations, so
+   ordering in the .css matters: --read must appear after --primary. */
+.thread__action--read {
+  background: var(--nh-bg-card);
+  border-color: var(--nh-border);
+  color: var(--nh-text);
+}
+
+.thread__action-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@media (hover: hover) {
+  .thread__action--primary:hover {
+    background: var(--nh-orange);
+    filter: brightness(0.95);
+  }
+  .thread__action--read:hover {
+    background: var(--nh-pressed);
+    filter: none;
+  }
+}
+
+.thread__action--icon {
+  flex: 0 0 auto;
+  width: 44px;
+  /* 10px each side keeps the 22px glyph in a 22px content box
+     (44 − 2px border − 20px padding) so the global
+     `svg { max-width: 100% }` reset doesn't downscale it. */
+  padding: 10px;
+}
+
+.thread__action-icon {
+  display: block;
+  /* Override the inline width/height on the Material SVGs (set to 28px
+     in the JSX) so the touch glyph is 22px in the 44px button (50%,
+     matching the icon/button ratio). The pointer-gated block shrinks
+     both button and glyph together — it must come AFTER this base rule
+     in source order (equal specificity), or the 20px pointer size
+     never wins the cascade. */
+  width: 22px;
+  height: 22px;
+}
+
+/* Pointer-capable devices: shrink the action bar a touch more. The 44px
+   base is the touch tap-target floor (Apple HIG 44pt / WCAG 2.5.5 AAA);
+   under a precise pointer it can go a little denser. Min-height drops to
+   36px; the glyphs scale to 20px (~55% of the button, a touch above 50%
+   so they don't read as undersized). The primary/stretch slot is left
+   uncapped on purpose: "Read article" / "Back to top" stretches to fill
+   the row so the bar stays full-width edge to edge.
+
+   Gated on `(hover: hover)` — pointer type, NOT viewport width — so a
+   mouse user gets the denser bar even in a narrow window, while
+   touch-primary devices keep the 44px tap-target floor at every width.
+   The *layout* change (Favorite/Share inline) stays width-gated via the
+   useWideViewport hook, since surfacing extra buttons is about
+   horizontal room, not pointer precision; the two concerns are
+   independent. */
+@media (hover: hover) {
+  .thread__action {
+    min-height: 36px;
+    padding: 6px 16px;
+  }
+
+  .thread__action-icon {
+    width: 20px;
+    height: 20px;
+  }
+
+  .thread__action--icon {
+    width: 36px;
+    /* 7px each side keeps the 20px icon inside a 20px content box
+       (36 − 2px border − 14px padding) so the global
+       `svg { max-width: 100% }` reset doesn't downscale it. */
+    padding: 7px;
+  }
+}
+
+.thread__action--active {
+  color: var(--nh-orange);
+  border-color: var(--nh-orange);
+}
+
+.thread__summary-card {
+  margin-bottom: 12px;
+  /* The loading state renders a probe <p>/<ul> with the same
+     .thread__summary-body / .thread__summary-list CSS as the real
+     content, just with invisible (shimmer-clipped) glyphs. The
+     browser's own wrap algorithm decides the skeleton's height, so
+     the card's natural height already approximates the final content
+     height without any TS-side math. overflow-anchor: none keeps the
+     browser's scroll anchoring from pinning *this* element: when the
+     card grows or shrinks as real content replaces the probe, the
+     browser anchors a following comment instead, absorbing the delta
+     silently. */
+  overflow-anchor: none;
+}
+
+.thread__summary-loading {
+  display: block;
+  margin-bottom: 8px;
+  font-size: 0.8125rem;
+  color: var(--nh-meta);
+}
+
+.thread__summary-body {
+  margin: 0;
+  font-size: 0.9375rem;
+  line-height: 1.5;
+  color: var(--nh-text);
+  word-wrap: break-word;
+}
+
+.thread__summary-body--muted {
+  color: var(--nh-meta);
+  font-style: italic;
+}
+
+.thread__summary-list {
+  margin: 0;
+  padding-left: 20px;
+  font-size: 0.9375rem;
+  line-height: 1.5;
+  color: var(--nh-text);
+}
+
+.thread__summary-list li {
+  margin-bottom: 6px;
+  word-wrap: break-word;
+}
+
+.thread__summary-list li:last-child {
+  margin-bottom: 0;
+}
+
+/* Bullet lists MarkdownText emits when a summary or insight is multi-point.
+   Tight margins keep the card compact; the indent leaves room for the marker. */
+.thread__summary-body .markdown-list,
+.thread__summary-list .markdown-list {
+  margin: 4px 0 0;
+  padding-left: 1.25rem;
+}
+
+.thread__summary-body .markdown-list li,
+.thread__summary-list .markdown-list li {
+  margin: 2px 0;
+}
+
+.thread__summary-card--comments {
+  margin-top: 8px;
+  margin-bottom: 8px;
+}
+
+/* Loading-state variants: the probe <p>/<ul> renders the real body/list
+   CSS so the browser lays it out identically to the final content, but
+   the glyphs are painted transparent and clipped over a shimmer gradient
+   so the user sees a paragraph- or list-shaped shimmer rather than the
+   filler prose underneath. `user-select: none` so long-pressing the
+   loading state doesn't grab the probe text. */
+.thread__summary-body--loading,
+.thread__summary-list--loading li {
+  /* `background-image` isn't inherited, so the shimmer has to sit on the
+     element that actually contains the text — the <p> for the article
+     card, and each <li> for the comments card (the <ul> itself has no
+     text nodes of its own). `-webkit-text-fill-color: transparent` is
+     required alongside `color: transparent` for Safari/iOS; WebKit
+     short-circuits `color: transparent` on its own and paints glyphs in
+     the computed color without letting `background-clip: text` apply. */
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+  background-image: linear-gradient(
+    90deg,
+    var(--nh-pressed, #ececec) 0%,
+    var(--nh-border, #dcdcdc) 50%,
+    var(--nh-pressed, #ececec) 100%
+  );
+  background-size: 200% 100%;
+  background-clip: text;
+  -webkit-background-clip: text;
+  animation: thread-summary-shimmer 1.2s ease-in-out infinite;
+  user-select: none;
+}
+
+/* Bullet markers inherit `color` on most engines, but be explicit so the
+   shimmer doesn't leak a solid dot alongside the clipped glyphs. */
+.thread__summary-list--loading ::marker {
+  color: transparent;
+}
+
+@keyframes thread-summary-shimmer {
+  0% {
+    background-position: 100% 0;
+  }
+  100% {
+    background-position: -100% 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .thread__summary-body--loading,
+  .thread__summary-list--loading li {
+    animation: none;
+  }
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.thread__summary-error {
+  color: var(--nh-text);
+  font-size: 0.875rem;
+}
+
+.thread__summary-error p {
+  margin: 0 0 8px;
+}
+
+.thread__summary-retry {
+  min-height: var(--tap-min);
+  padding: 8px 16px;
+  background: var(--nh-bg-card);
+  border: 1px solid var(--nh-border);
+  border-radius: 8px;
+  /* Action control — stays px (see .thread__action). */
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--nh-text);
+  cursor: pointer;
+}
+
+@media (hover: hover) {
+  .thread__summary-retry:hover {
+    background: var(--nh-pressed);
+  }
+}
+
+.thread__summary-footer {
+  margin-top: 8px;
+  font-size: 0.6875rem;
+  color: var(--nh-meta);
+}
+
+/* On the comments card, indent the loading label and footer so they line
+   up with the insight text (the <ul> has padding-left: 20px for bullets,
+   and the skeleton matches). */
+.thread__summary-card--comments .thread__summary-loading,
+.thread__summary-card--comments .thread__summary-footer {
+  padding-left: 20px;
+}
+
+.thread__meta {
+  color: var(--nh-meta);
+  font-size: 0.8125rem;
+  margin-bottom: 12px;
+}
+
+.thread__author,
+.thread__domain {
+  color: inherit;
+  font-weight: 600;
+  text-decoration: none;
+  padding: 4px 2px;
+}
+
+@media (hover: hover) {
+  .thread__author:hover,
+  .thread__domain:hover {
+    text-decoration: underline;
+  }
+}
+
+.thread__text {
+  font-size: 0.9375rem;
+  line-height: 1.5;
+  margin-bottom: 12px;
+  word-wrap: break-word;
+  color: var(--nh-text);
+}
+
+.thread__text a {
+  color: var(--nh-orange);
+  text-decoration: underline;
+}
+
+.thread__text pre {
+  overflow-x: auto;
+  background: var(--nh-bg-code);
+  padding: 8px;
+  border-radius: 4px;
+}
+
+.thread__comments {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.thread__sentinel {
+  height: 1px;
+}
+
+.thread__footer {
+  padding: 16px 16px 4px;
+  border-top: 1px solid var(--nh-border);
+}
+
+/* "Summarize article" button on the focused comment view. Sits between
+   the story-title heading and the comment meta — visually a low-weight
+   secondary action so it reads as "context available if you want it"
+   rather than a primary affordance. The reader is here for the comment;
+   the article is one tap away. Once tapped, this block is replaced by
+   the real <SummaryCard>, so the styling only matters for the pre-
+   reveal state. */
+.thread__lazy-summary {
+  margin: 0 0 12px;
+}
+
+.thread__lazy-summary-button {
+  display: inline-flex;
+  align-items: center;
+  min-height: 36px;
+  padding: 6px 14px;
+  background: var(--nh-bg-card);
+  border: 1px solid var(--nh-border);
+  border-radius: 8px;
+  color: var(--nh-text);
+  font: inherit;
+  /* Action control — stays px (see .thread__action). */
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+@media (hover: hover) {
+  .thread__lazy-summary-button:hover {
+    background: var(--nh-pressed);
+  }
+}
+
+.thread__lazy-summary-button:active {
+  background: var(--nh-border);
+}
+
+.thread__lazy-summary-button:focus-visible {
+  outline: 2px solid var(--nh-orange);
+  outline-offset: 2px;
+}
+
+/* Eyebrow above a focused comment-thread view. Replaces the story
+   title's role as a "what kind of page is this?" header — readable at
+   a glance but smaller than a story title since the comment body is
+   the thing the reader came for. */
+.thread__comment-eyebrow {
+  margin: 0 0 4px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--nh-meta);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+/* Root-story title shown directly under the eyebrow on a focused
+   comment view. Smaller than the story-page .thread__title (the
+   comment body is the page subject) but heavy enough to read as
+   "this is what the discussion is about" at a glance. Linked to the
+   story so a reader who wants context taps through. */
+.thread__comment-story-title {
+  margin: 0 0 8px;
+  font-size: 1.0625rem;
+  font-weight: 600;
+  line-height: 1.3;
+  color: var(--nh-text);
+}
+
+.thread__comment-story-title a {
+  color: inherit;
+  text-decoration: none;
+}
+
+@media (hover: hover) {
+  .thread__comment-story-title a:hover {
+    text-decoration: underline;
+  }
+}
+

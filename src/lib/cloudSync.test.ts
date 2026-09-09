@@ -1,0 +1,1688 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  getCloudSyncDebug,
+  mergeEntries,
+  noteCloudSyncAuthChange,
+  primeCloudSyncPull,
+  pullNow,
+  pushNow,
+  startCloudSync,
+  stopCloudSync,
+  subscribeCloudSyncDebug,
+  SYNC_HINT_KEY,
+  _flushCloudSyncForTests,
+  _getCloudSyncRuntimeForTests,
+  _resetCloudSyncDebugForTests,
+  _resetCloudSyncPrimeForTests,
+  type SyncState,
+} from './cloudSync';
+import {
+  addPinnedId,
+  getAllPinnedEntries,
+  getPinnedIds,
+  removePinnedId,
+} from './pinnedStories';
+import { addFavoriteId, getAllFavoriteEntries } from './favorites';
+import {
+  addHiddenId,
+  getAllHiddenEntries,
+} from './hiddenStories';
+import {
+  addDoneId,
+  getAllDoneEntries,
+  getDoneIds,
+  removeDoneId,
+  replaceDoneEntries,
+} from './doneStories';
+import {
+  AVATAR_PREFS_STORAGE_KEY,
+  getStoredAvatarPrefs,
+  setStoredAvatarPrefs,
+} from './avatarPrefs';
+import {
+  DEFAULT_HOT_THRESHOLDS,
+  getStoredHotThresholds,
+  setStoredHotThresholds,
+} from './hotThresholds';
+
+const NOW = Date.now();
+const T = {
+  T0: NOW - 5000,
+  T1: NOW - 4000,
+  T2: NOW - 3000,
+  T3: NOW - 2000,
+  T4: NOW - 1000,
+  T5: NOW,
+};
+
+function emptyState(): SyncState {
+  return { pinned: [], favorite: [], hidden: [], done: [] };
+}
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { 'content-type': 'application/json' },
+  });
+}
+
+type FetchMock = ReturnType<typeof vi.fn<typeof fetch>>;
+
+function queuedFetch(
+  queue: Array<{
+    matcher?: (input: RequestInfo | URL, init?: RequestInit) => boolean;
+    response: Response | ((init: RequestInit | undefined) => Response);
+  }>,
+): FetchMock {
+  const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const next = queue.shift();
+    if (!next) throw new Error(`Unexpected fetch: ${String(input)}`);
+    if (next.matcher && !next.matcher(input, init)) {
+      throw new Error(
+        `Fetch matcher failed for ${String(input)} ${init?.method ?? 'GET'}`,
+      );
+    }
+    return typeof next.response === 'function'
+      ? next.response(init)
+      : next.response;
+  }) as FetchMock;
+  return fetchMock;
+}
+
+// With debounceMs=0 and real timers, a setTimeout(0) + a few microtasks
+// are enough to drain any push/pull chain. Call twice on round-trips
+// that trigger a follow-up push inside runPush's finally block.
+async function drain(): Promise<void> {
+  await _flushCloudSyncForTests();
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  await _flushCloudSyncForTests();
+}
+
+describe('mergeEntries (client)', () => {
+  it('keeps newer `at` per id', () => {
+    const merged = mergeEntries(
+      [{ id: 1, at: 100 }],
+      [{ id: 1, at: 200 }],
+    );
+    expect(merged).toEqual([{ id: 1, at: 200 }]);
+  });
+
+  it('tombstone with newer at beats older additive', () => {
+    const merged = mergeEntries(
+      [{ id: 1, at: 100 }],
+      [{ id: 1, at: 200, deleted: true }],
+    );
+    expect(merged).toEqual([{ id: 1, at: 200, deleted: true }]);
+  });
+
+  it('sorts by id for deterministic writes', () => {
+    const merged = mergeEntries(
+      [{ id: 3, at: 300 }],
+      [
+        { id: 1, at: 100 },
+        { id: 2, at: 200 },
+      ],
+    );
+    expect(merged.map((e) => e.id)).toEqual([1, 2, 3]);
+  });
+});
+
+describe('cloudSync lifecycle', () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+    stopCloudSync();
+  });
+  afterEach(() => {
+    stopCloudSync();
+    vi.unstubAllGlobals();
+    window.localStorage.clear();
+  });
+
+  it('pulls server state on start and merges into local stores', async () => {
+    // Local has a pin the server doesn't know about at a newer time.
+    addPinnedId(1, T.T5);
+    // Server has a different pin (id 2) and a stale tombstone for id 1.
+    const server: SyncState = {
+      pinned: [
+        { id: 2, at: T.T3 },
+        { id: 1, at: T.T1, deleted: true },
+      ],
+      favorite: [],
+      hidden: [],
+      done: [],
+    };
+    const fetchMock = queuedFetch([
+      {
+        matcher: (input, init) =>
+          String(input) === '/api/sync' && (init?.method ?? 'GET') === 'GET',
+        response: jsonResponse(server),
+      },
+      // Initial post-pull flush will include id=1 (local wins LWW) → POST.
+      {
+        response: (init) => {
+          const body = JSON.parse(init?.body as string) as SyncState;
+          return jsonResponse(body);
+        },
+      },
+    ]);
+
+    await startCloudSync('alice', { fetchImpl: fetchMock, debounceMs: 0 });
+    await drain();
+
+    expect(getPinnedIds()).toEqual(new Set([1, 2]));
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('local add triggers a debounced POST with the delta', async () => {
+    const fetchMock = queuedFetch([
+      { response: jsonResponse(emptyState()) }, // initial GET
+      {
+        matcher: (input, init) =>
+          String(input) === '/api/sync' && init?.method === 'POST',
+        response: (init) => {
+          const body = JSON.parse(init?.body as string) as SyncState;
+          return jsonResponse(body);
+        },
+      },
+    ]);
+
+    await startCloudSync('alice', { fetchImpl: fetchMock, debounceMs: 0 });
+    await drain();
+    expect(fetchMock).toHaveBeenCalledTimes(1); // GET only — no local deltas
+
+    addPinnedId(42, T.T5);
+    await drain();
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const postInit = fetchMock.mock.calls[1][1] as RequestInit;
+    const body = JSON.parse(postInit.body as string) as SyncState;
+    expect(body.pinned).toEqual([{ id: 42, at: T.T5 }]);
+    expect(body.favorite).toEqual([]);
+    expect(body.hidden).toEqual([]);
+  });
+
+  it('coalesces rapid-fire changes into a single POST', async () => {
+    const fetchMock = queuedFetch([
+      { response: jsonResponse(emptyState()) },
+      {
+        response: (init) => {
+          const body = JSON.parse(init?.body as string) as SyncState;
+          return jsonResponse(body);
+        },
+      },
+    ]);
+
+    await startCloudSync('alice', { fetchImpl: fetchMock, debounceMs: 50 });
+    await drain();
+
+    addPinnedId(1, T.T3);
+    addFavoriteId(2, T.T4);
+    addHiddenId(3, T.T5);
+
+    // Wait for the debounce to fire.
+    await new Promise<void>((resolve) => setTimeout(resolve, 80));
+    await drain();
+
+    expect(fetchMock).toHaveBeenCalledTimes(2); // GET + one POST
+    const body = JSON.parse(
+      (fetchMock.mock.calls[1][1] as RequestInit).body as string,
+    ) as SyncState;
+    expect(body.pinned).toEqual([{ id: 1, at: T.T3 }]);
+    expect(body.favorite).toEqual([{ id: 2, at: T.T4 }]);
+    expect(body.hidden).toEqual([{ id: 3, at: T.T5 }]);
+  });
+
+  it('pushes tombstones for removes', async () => {
+    addPinnedId(1, T.T1);
+    const fetchMock = queuedFetch([
+      { response: jsonResponse(emptyState()) }, // GET
+      {
+        response: (init) => {
+          const body = JSON.parse(init?.body as string) as SyncState;
+          return jsonResponse(body);
+        },
+      }, // POST #1: flush initial pin
+      {
+        response: (init) => {
+          const body = JSON.parse(init?.body as string) as SyncState;
+          return jsonResponse(body);
+        },
+      }, // POST #2: flush tombstone
+    ]);
+
+    await startCloudSync('alice', { fetchImpl: fetchMock, debounceMs: 0 });
+    await drain();
+    expect(fetchMock).toHaveBeenCalledTimes(2); // GET + initial flush POST
+
+    removePinnedId(1, T.T5);
+    await drain();
+
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    const body = JSON.parse(
+      (fetchMock.mock.calls[2][1] as RequestInit).body as string,
+    ) as SyncState;
+    expect(body.pinned).toEqual([{ id: 1, at: T.T5, deleted: true }]);
+  });
+
+  it('does not re-push entries the server already has', async () => {
+    const server: SyncState = {
+      pinned: [{ id: 1, at: T.T3 }],
+      favorite: [],
+      hidden: [],
+      done: [],
+    };
+    // Only a GET is queued. If an unexpected POST fires, the mock throws.
+    const fetchMock = queuedFetch([{ response: jsonResponse(server) }]);
+
+    await startCloudSync('alice', { fetchImpl: fetchMock, debounceMs: 0 });
+    await drain();
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(getPinnedIds()).toEqual(new Set([1]));
+  });
+
+  it('still pushes a local-only entry older than the server max after a pull', async () => {
+    // Regression: the pull path used to raise lastPushed to the
+    // server's max `at`, so a pin made on this device at T1 (e.g.
+    // before sign-in) was treated as "already pushed" once another
+    // device had pushed anything newer — and never reached the server.
+    addPinnedId(1, T.T1);
+    const server: SyncState = {
+      pinned: [{ id: 2, at: T.T3 }],
+      favorite: [],
+      hidden: [],
+      done: [],
+    };
+    const fetchMock = queuedFetch([
+      { response: jsonResponse(server) },
+      {
+        matcher: (input, init) =>
+          String(input) === '/api/sync' && init?.method === 'POST',
+        response: (init) => {
+          const body = JSON.parse(init?.body as string) as SyncState;
+          return jsonResponse(body);
+        },
+      },
+    ]);
+
+    await startCloudSync('alice', { fetchImpl: fetchMock, debounceMs: 0 });
+    await drain();
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const body = JSON.parse(
+      (fetchMock.mock.calls[1][1] as RequestInit).body as string,
+    ) as SyncState;
+    expect(body.pinned).toContainEqual({ id: 1, at: T.T1 });
+  });
+
+  it('a push resolving across stop/start does not touch the new runtime', async () => {
+    // Regression: push() used to dereference the module runtime after
+    // the await — a sign-out (null) crashed it, and a different user's
+    // sign-in during the POST got their watermarks contaminated.
+    addPinnedId(7, T.T2);
+    let releasePost!: (r: Response) => void;
+    const postGate = new Promise<Response>((resolve) => {
+      releasePost = resolve;
+    });
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      if ((init?.method ?? 'GET') === 'GET') return jsonResponse(emptyState());
+      return postGate;
+    }) as FetchMock;
+
+    await startCloudSync('alice', { fetchImpl: fetchMock, debounceMs: 0 });
+    await _flushCloudSyncForTests();
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    // Alice's POST of pin 7 is now held open behind the gate.
+    stopCloudSync();
+    // Fresh device state for the next user: bob has nothing local, so
+    // his watermark stays 0 unless the stale push contaminates it.
+    window.localStorage.clear();
+    const fetchMock2 = queuedFetch([{ response: jsonResponse(emptyState()) }]);
+    await startCloudSync('bob', { fetchImpl: fetchMock2, debounceMs: 0 });
+    await drain();
+    expect(_getCloudSyncRuntimeForTests()!.lastPushed.pinned).toBe(0);
+
+    releasePost(
+      jsonResponse({
+        pinned: [{ id: 7, at: T.T2 }],
+        favorite: [],
+        hidden: [],
+        done: [],
+      }),
+    );
+    await drain();
+
+    expect(_getCloudSyncRuntimeForTests()!.lastPushed.pinned).toBe(0);
+  });
+
+  it('a pull resolving across stop/start is not applied to the new session', async () => {
+    let releaseGet!: (r: Response) => void;
+    const getGate = new Promise<Response>((resolve) => {
+      releaseGet = resolve;
+    });
+    const fetchMock = vi.fn(async () => getGate) as FetchMock;
+
+    const alicePromise = startCloudSync('alice', {
+      fetchImpl: fetchMock,
+      debounceMs: 0,
+    });
+    // Alice's GET is in flight; swap sessions underneath it.
+    stopCloudSync();
+    const fetchMock2 = queuedFetch([{ response: jsonResponse(emptyState()) }]);
+    await startCloudSync('bob', { fetchImpl: fetchMock2, debounceMs: 0 });
+    await drain();
+
+    releaseGet(
+      jsonResponse({
+        pinned: [{ id: 9, at: T.T3 }],
+        favorite: [],
+        hidden: [],
+        done: [],
+      }),
+    );
+    await alicePromise;
+    await drain();
+
+    // Alice's stale response must not leak into bob's stores.
+    expect(getPinnedIds()).toEqual(new Set());
+  });
+
+  it('survives a failed POST — next change retries', async () => {
+    const fetchMock = queuedFetch([
+      { response: jsonResponse(emptyState()) }, // GET
+      { response: jsonResponse({ error: 'nope' }, 503) }, // failed POST
+      {
+        response: (init) => {
+          const body = JSON.parse(init?.body as string) as SyncState;
+          return jsonResponse(body);
+        },
+      }, // retry POST
+    ]);
+
+    await startCloudSync('alice', { fetchImpl: fetchMock, debounceMs: 0 });
+    await drain();
+    expect(fetchMock).toHaveBeenCalledTimes(1); // GET only
+
+    addPinnedId(1, T.T3);
+    await drain();
+    expect(fetchMock).toHaveBeenCalledTimes(2); // GET + failed POST
+
+    // High-water mark must NOT have advanced — the second change must
+    // re-include the pending delta so the previous unsuccessful push
+    // isn't silently lost.
+    addPinnedId(2, T.T4);
+    await drain();
+
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    const body = JSON.parse(
+      (fetchMock.mock.calls[2][1] as RequestInit).body as string,
+    ) as SyncState;
+    const ids = body.pinned.map((e) => e.id).sort();
+    expect(ids).toEqual([1, 2]);
+  });
+
+  it('stop() unbinds event listeners', async () => {
+    const fetchMock = queuedFetch([
+      { response: jsonResponse(emptyState()) },
+    ]);
+    await startCloudSync('alice', { fetchImpl: fetchMock, debounceMs: 0 });
+    await drain();
+
+    stopCloudSync();
+    addPinnedId(99, T.T5);
+    await drain();
+
+    expect(fetchMock).toHaveBeenCalledTimes(1); // no POST after stop
+    expect(_getCloudSyncRuntimeForTests()).toBeNull();
+  });
+
+  it('does not mutate local state when the pull fails', async () => {
+    addPinnedId(1, T.T3);
+    const fetchMock = queuedFetch([
+      { response: jsonResponse({ error: 'boom' }, 500) },
+      // Initial flush POST after the failed pull.
+      {
+        response: (init) => {
+          const body = JSON.parse(init?.body as string) as SyncState;
+          return jsonResponse(body);
+        },
+      },
+    ]);
+    await startCloudSync('alice', { fetchImpl: fetchMock, debounceMs: 0 });
+    await drain();
+
+    expect(getPinnedIds()).toEqual(new Set([1]));
+  });
+
+  it('merges server tombstones into local on pull', async () => {
+    addPinnedId(5, T.T1);
+    const server: SyncState = {
+      pinned: [{ id: 5, at: T.T4, deleted: true }],
+      favorite: [],
+      hidden: [],
+      done: [],
+    };
+    const fetchMock = queuedFetch([{ response: jsonResponse(server) }]);
+    await startCloudSync('alice', { fetchImpl: fetchMock, debounceMs: 0 });
+    await drain();
+
+    expect(getPinnedIds()).toEqual(new Set());
+    expect(getAllPinnedEntries()).toEqual([
+      { id: 5, at: T.T4, deleted: true },
+    ]);
+  });
+
+  it('adopts a newer avatar record from the server on pull', async () => {
+    // Local starts with the default (no `at` → treated as 0).
+    const server: SyncState = {
+      pinned: [],
+      favorite: [],
+      hidden: [],
+      done: [],
+      avatar: {
+        source: 'github',
+        githubUsername: 'alice-real',
+        at: T.T3,
+      },
+    };
+    const fetchMock = queuedFetch([{ response: jsonResponse(server) }]);
+
+    await startCloudSync('alice', { fetchImpl: fetchMock, debounceMs: 0 });
+    await drain();
+
+    const prefs = getStoredAvatarPrefs();
+    expect(prefs.source).toBe('github');
+    expect(prefs.githubUsername).toBe('alice-real');
+    expect(prefs.at).toBe(T.T3);
+  });
+
+  it('keeps a newer local avatar and pushes it when the server is older', async () => {
+    // Local is newer (just saved).
+    setStoredAvatarPrefs(
+      { source: 'github', githubUsername: 'alice-new' },
+      T.T5,
+    );
+    const server: SyncState = {
+      pinned: [],
+      favorite: [],
+      hidden: [],
+      done: [],
+      avatar: {
+        source: 'github',
+        githubUsername: 'alice-old',
+        at: T.T1,
+      },
+    };
+    const fetchMock = queuedFetch([
+      { response: jsonResponse(server) }, // initial GET: server is older
+      {
+        matcher: (input, init) =>
+          String(input) === '/api/sync' && init?.method === 'POST',
+        response: (init) => {
+          const body = JSON.parse(init?.body as string) as SyncState;
+          return jsonResponse({ ...body, avatar: body.avatar });
+        },
+      },
+    ]);
+
+    await startCloudSync('alice', { fetchImpl: fetchMock, debounceMs: 0 });
+    await drain();
+
+    // Local override survived — server record did not overwrite.
+    expect(getStoredAvatarPrefs().githubUsername).toBe('alice-new');
+    // And we POSTed our newer avatar.
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const body = JSON.parse(
+      (fetchMock.mock.calls[1][1] as RequestInit).body as string,
+    ) as SyncState;
+    expect(body.avatar).toEqual({
+      source: 'github',
+      githubUsername: 'alice-new',
+      at: T.T5,
+    });
+  });
+
+  it('never sends a raw email in the avatar delta', async () => {
+    setStoredAvatarPrefs(
+      {
+        source: 'gravatar',
+        gravatarEmail: 'alice@example.com',
+        gravatarHash: 'a'.repeat(64),
+      },
+      T.T5,
+    );
+    const fetchMock = queuedFetch([
+      { response: jsonResponse(emptyState()) },
+      {
+        response: (init) => {
+          const body = JSON.parse(init?.body as string) as SyncState;
+          return jsonResponse(body);
+        },
+      },
+    ]);
+
+    await startCloudSync('alice', { fetchImpl: fetchMock, debounceMs: 0 });
+    await drain();
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const body = JSON.parse(
+      (fetchMock.mock.calls[1][1] as RequestInit).body as string,
+    ) as SyncState;
+    expect(body.avatar).toEqual({
+      source: 'gravatar',
+      gravatarHash: 'a'.repeat(64),
+      at: T.T5,
+    });
+    expect(body.avatar).not.toHaveProperty('gravatarEmail');
+  });
+
+  it('a local save after login triggers an avatar push', async () => {
+    const fetchMock = queuedFetch([
+      { response: jsonResponse(emptyState()) }, // initial GET
+      {
+        matcher: (input, init) =>
+          String(input) === '/api/sync' && init?.method === 'POST',
+        response: (init) => {
+          const body = JSON.parse(init?.body as string) as SyncState;
+          return jsonResponse(body);
+        },
+      },
+    ]);
+
+    await startCloudSync('alice', { fetchImpl: fetchMock, debounceMs: 0 });
+    await drain();
+    expect(fetchMock).toHaveBeenCalledTimes(1); // GET only
+
+    setStoredAvatarPrefs({ source: 'none' }, T.T5);
+    await drain();
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const body = JSON.parse(
+      (fetchMock.mock.calls[1][1] as RequestInit).body as string,
+    ) as SyncState;
+    expect(body.avatar).toEqual({ source: 'none', at: T.T5 });
+  });
+
+  it('does not re-push the same avatar record once acknowledged', async () => {
+    const server: SyncState = {
+      pinned: [],
+      favorite: [],
+      hidden: [],
+      done: [],
+      avatar: { source: 'github', at: T.T3 },
+    };
+    // Only a GET queued — if an unexpected POST fires, the mock throws.
+    const fetchMock = queuedFetch([{ response: jsonResponse(server) }]);
+
+    await startCloudSync('alice', { fetchImpl: fetchMock, debounceMs: 0 });
+    await drain();
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(getStoredAvatarPrefs().at).toBe(T.T3);
+  });
+
+  it('ignores a malformed avatar in the pull response', async () => {
+    // Start with a local record at T1.
+    setStoredAvatarPrefs({ source: 'github' }, T.T1);
+    // Server returns garbage for avatar. The other three lists are fine.
+    window.localStorage.setItem(
+      'probe-before',
+      window.localStorage.getItem(AVATAR_PREFS_STORAGE_KEY) ?? '',
+    );
+    const bogusServer = {
+      pinned: [],
+      favorite: [],
+      hidden: [],
+      done: [],
+      avatar: { source: 'linkedin', at: 'soon' },
+    };
+    const fetchMock = queuedFetch([
+      { response: jsonResponse(bogusServer) },
+      {
+        response: (init) => {
+          const body = JSON.parse(init?.body as string) as SyncState;
+          return jsonResponse(body);
+        },
+      },
+    ]);
+
+    await startCloudSync('alice', { fetchImpl: fetchMock, debounceMs: 0 });
+    await drain();
+
+    // Local avatar is untouched; the bogus server record didn't poison it.
+    expect(getStoredAvatarPrefs().at).toBe(T.T1);
+    // Post should have fired (because our local record is newer than the
+    // high-water mark of 0), so we flush it.
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('propagates all four lists through a round-trip', async () => {
+    addPinnedId(1, T.T3);
+    addFavoriteId(2, T.T4);
+    addHiddenId(3, T.T5);
+    addDoneId(4, T.T5);
+    const fetchMock = queuedFetch([
+      { response: jsonResponse(emptyState()) },
+      {
+        response: (init) => {
+          const body = JSON.parse(init?.body as string) as SyncState;
+          return jsonResponse(body);
+        },
+      },
+    ]);
+
+    await startCloudSync('alice', { fetchImpl: fetchMock, debounceMs: 0 });
+    await drain();
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const body = JSON.parse(
+      (fetchMock.mock.calls[1][1] as RequestInit).body as string,
+    ) as SyncState;
+    expect(body.pinned).toEqual([{ id: 1, at: T.T3 }]);
+    expect(body.favorite).toEqual([{ id: 2, at: T.T4 }]);
+    expect(body.hidden).toEqual([{ id: 3, at: T.T5 }]);
+    expect(body.done).toEqual([{ id: 4, at: T.T5 }]);
+
+    // Local state still intact after the round-trip.
+    expect(getAllPinnedEntries().map((e) => e.id)).toEqual([1]);
+    expect(getAllFavoriteEntries().map((e) => e.id)).toEqual([2]);
+    expect(getAllHiddenEntries().map((e) => e.id)).toEqual([3]);
+    expect(getAllDoneEntries().map((e) => e.id)).toEqual([4]);
+  });
+
+  it('merges server Done tombstones into local on pull', async () => {
+    addDoneId(5, T.T1);
+    const server: SyncState = {
+      pinned: [],
+      favorite: [],
+      hidden: [],
+      done: [{ id: 5, at: T.T4, deleted: true }],
+    };
+    const fetchMock = queuedFetch([{ response: jsonResponse(server) }]);
+    await startCloudSync('alice', { fetchImpl: fetchMock, debounceMs: 0 });
+    await drain();
+
+    expect(getDoneIds()).toEqual(new Set());
+    expect(getAllDoneEntries()).toEqual([
+      { id: 5, at: T.T4, deleted: true },
+    ]);
+  });
+
+  it('a local Done add triggers a debounced POST with the delta', async () => {
+    const fetchMock = queuedFetch([
+      { response: jsonResponse(emptyState()) }, // GET
+      {
+        response: (init) => {
+          const body = JSON.parse(init?.body as string) as SyncState;
+          return jsonResponse(body);
+        },
+      }, // POST
+    ]);
+
+    await startCloudSync('alice', { fetchImpl: fetchMock, debounceMs: 0 });
+    await drain();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    addDoneId(42, T.T5);
+    await drain();
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const body = JSON.parse(
+      (fetchMock.mock.calls[1][1] as RequestInit).body as string,
+    ) as SyncState;
+    expect(body.done).toEqual([{ id: 42, at: T.T5 }]);
+  });
+
+  it('pushes tombstones for done removes', async () => {
+    addDoneId(1, T.T1);
+    const fetchMock = queuedFetch([
+      { response: jsonResponse(emptyState()) }, // GET
+      {
+        response: (init) => {
+          const body = JSON.parse(init?.body as string) as SyncState;
+          return jsonResponse(body);
+        },
+      }, // initial flush POST
+      {
+        response: (init) => {
+          const body = JSON.parse(init?.body as string) as SyncState;
+          return jsonResponse(body);
+        },
+      }, // tombstone POST
+    ]);
+
+    await startCloudSync('alice', { fetchImpl: fetchMock, debounceMs: 0 });
+    await drain();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    removeDoneId(1, T.T5);
+    await drain();
+
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    const body = JSON.parse(
+      (fetchMock.mock.calls[2][1] as RequestInit).body as string,
+    ) as SyncState;
+    expect(body.done).toEqual([{ id: 1, at: T.T5, deleted: true }]);
+  });
+
+  it('adopts a newer hotThresholds record from the server on pull', async () => {
+    const server: SyncState = {
+      pinned: [],
+      favorite: [],
+      hidden: [],
+      done: [],
+      hotThresholds: {
+        topEnabled: false,
+        topScoreMin: 250,
+        topDescendantsMin: 120,
+        newEnabled: true,
+        newVelocityMin: 20,
+        newDescendantsMin: 5,
+        at: T.T3,
+      },
+    };
+    const fetchMock = queuedFetch([{ response: jsonResponse(server) }]);
+    await startCloudSync('alice', { fetchImpl: fetchMock, debounceMs: 0 });
+    await drain();
+
+    const prefs = getStoredHotThresholds();
+    expect(prefs.topEnabled).toBe(false);
+    expect(prefs.topScoreMin).toBe(250);
+    expect(prefs.newVelocityMin).toBe(20);
+    expect(prefs.at).toBe(T.T3);
+  });
+
+  it('keeps newer local hotThresholds and pushes them when the server is older', async () => {
+    setStoredHotThresholds(
+      { ...DEFAULT_HOT_THRESHOLDS, topEnabled: false, topScoreMin: 150 },
+      T.T5,
+    );
+    const server: SyncState = {
+      pinned: [],
+      favorite: [],
+      hidden: [],
+      done: [],
+      hotThresholds: {
+        topEnabled: true,
+        topScoreMin: 200,
+        topDescendantsMin: 100,
+        newEnabled: true,
+        newVelocityMin: 15,
+        newDescendantsMin: 10,
+        at: T.T1,
+      },
+    };
+    const fetchMock = queuedFetch([
+      { response: jsonResponse(server) },
+      {
+        matcher: (input, init) =>
+          String(input) === '/api/sync' && init?.method === 'POST',
+        response: (init) => {
+          const body = JSON.parse(init?.body as string) as SyncState;
+          return jsonResponse(body);
+        },
+      },
+    ]);
+
+    await startCloudSync('alice', { fetchImpl: fetchMock, debounceMs: 0 });
+    await drain();
+
+    expect(getStoredHotThresholds().topScoreMin).toBe(150);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const body = JSON.parse(
+      (fetchMock.mock.calls[1][1] as RequestInit).body as string,
+    ) as SyncState;
+    expect(body.hotThresholds).toEqual({
+      topEnabled: false,
+      topScoreMin: 150,
+      topDescendantsMin: DEFAULT_HOT_THRESHOLDS.topDescendantsMin,
+      newEnabled: true,
+      newVelocityMin: DEFAULT_HOT_THRESHOLDS.newVelocityMin,
+      newDescendantsMin: DEFAULT_HOT_THRESHOLDS.newDescendantsMin,
+      at: T.T5,
+    });
+  });
+
+  it('a local hotThresholds save after login triggers a push', async () => {
+    const fetchMock = queuedFetch([
+      { response: jsonResponse(emptyState()) },
+      {
+        matcher: (input, init) =>
+          String(input) === '/api/sync' && init?.method === 'POST',
+        response: (init) => {
+          const body = JSON.parse(init?.body as string) as SyncState;
+          return jsonResponse(body);
+        },
+      },
+    ]);
+
+    await startCloudSync('alice', { fetchImpl: fetchMock, debounceMs: 0 });
+    await drain();
+    expect(fetchMock).toHaveBeenCalledTimes(1); // GET only
+
+    setStoredHotThresholds(
+      { ...DEFAULT_HOT_THRESHOLDS, newEnabled: false },
+      T.T5,
+    );
+    await drain();
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const body = JSON.parse(
+      (fetchMock.mock.calls[1][1] as RequestInit).body as string,
+    ) as SyncState;
+    expect(body.hotThresholds?.newEnabled).toBe(false);
+    expect(body.hotThresholds?.at).toBe(T.T5);
+  });
+
+  it('ignores a malformed hotThresholds in the pull response', async () => {
+    setStoredHotThresholds(
+      { ...DEFAULT_HOT_THRESHOLDS, topScoreMin: 170 },
+      T.T1,
+    );
+    const fetchMock = queuedFetch([
+      {
+        response: jsonResponse({
+          pinned: [],
+          favorite: [],
+          hidden: [],
+          done: [],
+          // Missing required `topEnabled` → strict validator drops it.
+          hotThresholds: { topScoreMin: 999, at: T.T5 },
+        }),
+      },
+    ]);
+
+    await startCloudSync('alice', { fetchImpl: fetchMock, debounceMs: 0 });
+    await drain();
+
+    expect(getStoredHotThresholds().topScoreMin).toBe(170);
+  });
+});
+
+describe('boot-time pull priming', () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+    stopCloudSync();
+    _resetCloudSyncPrimeForTests();
+    _resetCloudSyncDebugForTests();
+  });
+  afterEach(() => {
+    stopCloudSync();
+    _resetCloudSyncPrimeForTests();
+    _resetCloudSyncDebugForTests();
+    vi.unstubAllGlobals();
+    window.localStorage.clear();
+  });
+
+  it('does nothing for a browser that has never synced', () => {
+    const fetchMock = queuedFetch([]);
+    primeCloudSyncPull({ fetchImpl: fetchMock });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('fetches at boot and hands the answer to startCloudSync', async () => {
+    window.localStorage.setItem(SYNC_HINT_KEY, '1');
+    const primeFetch = queuedFetch([
+      { response: jsonResponse({ pinned: [{ id: 42, at: T.T1 }], favorite: [], hidden: [], done: [] }) },
+    ]);
+    primeCloudSyncPull({ fetchImpl: primeFetch });
+    expect(primeFetch).toHaveBeenCalledTimes(1);
+
+    // startCloudSync's own fetch impl must not be asked for the same
+    // state a second time — the only call it may make is the follow-up
+    // push of local-only entries.
+    const startFetch = queuedFetch([
+      { matcher: (_i, init) => init?.method === 'POST', response: jsonResponse({}) },
+    ]);
+    await startCloudSync('alice', { fetchImpl: startFetch, debounceMs: 0 });
+    await drain();
+
+    expect(getPinnedIds().has(42)).toBe(true);
+    expect(primeFetch).toHaveBeenCalledTimes(1);
+    expect(
+      startFetch.mock.calls.filter(([, init]) => (init?.method ?? 'GET') === 'GET'),
+    ).toHaveLength(0);
+  });
+
+  it('pulls fresh when the primed response is too old to still be current', async () => {
+    window.localStorage.setItem(SYNC_HINT_KEY, '1');
+    const primeFetch = queuedFetch([
+      { response: jsonResponse({ pinned: [{ id: 42, at: T.T1 }], favorite: [], hidden: [], done: [] }) },
+    ]);
+    // Primed a full day ago — a tab restored from bfcache, say.
+    await primeCloudSyncPull({
+      fetchImpl: primeFetch,
+      now: Date.now() - 86_400_000,
+    });
+
+    const startFetch = queuedFetch([
+      { response: jsonResponse({ pinned: [{ id: 7, at: T.T1 }], favorite: [], hidden: [], done: [] }) },
+      { matcher: (_i, init) => init?.method === 'POST', response: jsonResponse({}) },
+    ]);
+    await startCloudSync('alice', { fetchImpl: startFetch, debounceMs: 0 });
+    await drain();
+
+    // The stale snapshot isn't *unmerged* — it was applied when it
+    // landed, and a pull is a pull. What staleness governs is that
+    // startCloudSync asks again rather than trusting it, so anything
+    // that changed on the server since is picked up.
+    expect(getPinnedIds().has(7)).toBe(true);
+    expect(
+      startFetch.mock.calls.filter(([, init]) => (init?.method ?? 'GET') === 'GET'),
+    ).toHaveLength(1);
+  });
+
+  it('merges a primed response into the local stores before sync even starts', async () => {
+    // The whole point of priming: a pin made in the companion app is on
+    // this device — visible, and downloading — without waiting for the
+    // cache to rehydrate, React to mount, or auth to resolve.
+    window.localStorage.setItem(SYNC_HINT_KEY, '1');
+    const primeFetch = queuedFetch([
+      { response: jsonResponse({ pinned: [{ id: 55, at: T.T1 }], favorite: [], hidden: [], done: [] }) },
+    ]);
+
+    await primeCloudSyncPull({ fetchImpl: primeFetch });
+
+    expect(getPinnedIds().has(55)).toBe(true);
+    expect(_getCloudSyncRuntimeForTests()).toBeNull();
+  });
+
+  it('stops priming once the origin says the browser is signed out', async () => {
+    window.localStorage.setItem(SYNC_HINT_KEY, '1');
+    const fetchMock = queuedFetch([
+      { response: jsonResponse({ error: 'Not authenticated' }, 401) },
+    ]);
+    primeCloudSyncPull({ fetchImpl: fetchMock });
+    await drain();
+
+    expect(window.localStorage.getItem(SYNC_HINT_KEY)).toBeNull();
+    _resetCloudSyncPrimeForTests();
+    const secondFetch = queuedFetch([]);
+    primeCloudSyncPull({ fetchImpl: secondFetch });
+    expect(secondFetch).not.toHaveBeenCalled();
+  });
+
+  it('pulls fresh when the primed request settles past the window', async () => {
+    // The age check has to run again after the await: a request that was
+    // young enough when startCloudSync began waiting can settle on the
+    // far side of the 60 s boundary.
+    window.localStorage.setItem(SYNC_HINT_KEY, '1');
+    let clock = Date.now();
+    const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => clock);
+    try {
+      let release!: () => void;
+      const gate = new Promise<void>((r) => {
+        release = r;
+      });
+      const primeFetch = vi.fn(async () => {
+        await gate;
+        return jsonResponse({
+          pinned: [{ id: 42, at: T.T1 }],
+          favorite: [],
+          hidden: [],
+          done: [],
+        });
+      }) as unknown as FetchMock;
+      // Primed 59 s ago: usable when the start begins waiting.
+      void primeCloudSyncPull({ fetchImpl: primeFetch, now: clock - 59_000 });
+
+      const startFetch = queuedFetch([
+        { response: jsonResponse({ pinned: [{ id: 7, at: T.T1 }], favorite: [], hidden: [], done: [] }) },
+        { matcher: (_i, init) => init?.method === 'POST', response: jsonResponse({}) },
+      ]);
+      const started = startCloudSync('alice', {
+        fetchImpl: startFetch,
+        debounceMs: 0,
+      });
+      // The request settles two seconds later — now expired.
+      clock += 2_000;
+      release();
+      await started;
+      await drain();
+
+      expect(getPinnedIds().has(7)).toBe(true);
+      expect(
+        startFetch.mock.calls.filter(([, init]) => (init?.method ?? 'GET') === 'GET'),
+      ).toHaveLength(1);
+      // The expired snapshot isn't applied by either path.
+      expect(getPinnedIds().has(42)).toBe(false);
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it('does not hand a primed snapshot to an account that signed in after it', async () => {
+    // The runtime-lifecycle counter can't see this on its own: on a cold
+    // boot nothing has started yet, so a login replaces the cookie while
+    // `runtime` is still null and the *new* account's start would
+    // otherwise find a matching prime, apply the previous account's
+    // lists, and adopt them as its own push watermarks.
+    window.localStorage.setItem(SYNC_HINT_KEY, '1');
+    const primeFetch = queuedFetch([
+      { response: jsonResponse({ pinned: [{ id: 42, at: T.T1 }], favorite: [], hidden: [], done: [] }) },
+    ]);
+    await primeCloudSyncPull({ fetchImpl: primeFetch });
+    // Whatever the prime already merged belongs to the account that was
+    // signed in when it was sent; this test is about what the *next*
+    // account gets handed.
+    window.localStorage.clear();
+
+    // useAuth reports the login.
+    noteCloudSyncAuthChange();
+
+    const bobFetch = queuedFetch([
+      { response: jsonResponse({ pinned: [{ id: 7, at: T.T1 }], favorite: [], hidden: [], done: [] }) },
+      { matcher: (_i, init) => init?.method === 'POST', response: jsonResponse({}) },
+    ]);
+    await startCloudSync('bob', { fetchImpl: bobFetch, debounceMs: 0 });
+    await drain();
+
+    expect(getPinnedIds().has(7)).toBe(true);
+    expect(getPinnedIds().has(42)).toBe(false);
+    expect(
+      bobFetch.mock.calls.filter(([, init]) => (init?.method ?? 'GET') === 'GET'),
+    ).toHaveLength(1);
+  });
+
+  it('does not merge a primed snapshot across a session change', async () => {
+    // The response carries no identity of its own, so a request sent
+    // under one session and landing after a sign-out or account switch
+    // must not write that session's lists into the stores the current
+    // one reads.
+    window.localStorage.setItem(SYNC_HINT_KEY, '1');
+    let release!: () => void;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const primeFetch = vi.fn(async () => {
+      await gate;
+      return jsonResponse({
+        pinned: [{ id: 42, at: T.T1 }],
+        favorite: [],
+        hidden: [],
+        done: [],
+      });
+    }) as unknown as FetchMock;
+    void primeCloudSyncPull({ fetchImpl: primeFetch });
+
+    // First session consumes the prime and blocks on it…
+    const aliceFetch = queuedFetch([
+      { matcher: (_i, init) => init?.method === 'POST', response: jsonResponse({}) },
+    ]);
+    const alice = startCloudSync('alice', {
+      fetchImpl: aliceFetch,
+      debounceMs: 0,
+    });
+    // …and while it's in flight, the session changes.
+    stopCloudSync();
+    const bobFetch = queuedFetch([
+      { response: jsonResponse(emptyState()) },
+    ]);
+    await startCloudSync('bob', { fetchImpl: bobFetch, debounceMs: 0 });
+
+    release();
+    await alice;
+    await drain();
+
+    expect(getPinnedIds().has(42)).toBe(false);
+  });
+
+  it('pulls fresh when a login lands while the primed pull is in flight', async () => {
+    // The post-await checks covered the runtime being swapped and the
+    // snapshot ageing out, but not the window in between: a login or
+    // logout bumps the generation the moment the cookie changes, while
+    // React's useCloudSync effect is still a tick from stopping or
+    // replacing the runtime — so runtime identity alone still says this
+    // snapshot belongs here, and it doesn't.
+    window.localStorage.setItem(SYNC_HINT_KEY, '1');
+    let release!: () => void;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const primeFetch = vi.fn(async () => {
+      await gate;
+      return jsonResponse({
+        pinned: [{ id: 42, at: T.T1 }],
+        favorite: [],
+        hidden: [],
+        done: [],
+      });
+    }) as unknown as FetchMock;
+    void primeCloudSyncPull({ fetchImpl: primeFetch });
+
+    const startFetch = queuedFetch([
+      { response: jsonResponse({ pinned: [{ id: 7, at: T.T1 }], favorite: [], hidden: [], done: [] }) },
+      { matcher: (_i, init) => init?.method === 'POST', response: jsonResponse({}) },
+    ]);
+    const started = startCloudSync('alice', {
+      fetchImpl: startFetch,
+      debounceMs: 0,
+    });
+    // useAuth reports the cookie change; the runtime is untouched.
+    noteCloudSyncAuthChange();
+    release();
+    await started;
+    await drain();
+
+    expect(getPinnedIds().has(7)).toBe(true);
+    expect(getPinnedIds().has(42)).toBe(false);
+    expect(
+      startFetch.mock.calls.filter(([, init]) => (init?.method ?? 'GET') === 'GET'),
+    ).toHaveLength(1);
+  });
+
+  it('falls back to a fresh pull when the primed request failed', async () => {
+    window.localStorage.setItem(SYNC_HINT_KEY, '1');
+    const primeFetch = queuedFetch([
+      { response: jsonResponse({ error: 'nope' }, 503) },
+    ]);
+    await primeCloudSyncPull({ fetchImpl: primeFetch });
+
+    const startFetch = queuedFetch([
+      { response: jsonResponse({ pinned: [{ id: 7, at: T.T1 }], favorite: [], hidden: [], done: [] }) },
+      { matcher: (_i, init) => init?.method === 'POST', response: jsonResponse({}) },
+    ]);
+    await startCloudSync('alice', { fetchImpl: startFetch, debounceMs: 0 });
+    await drain();
+
+    // Without the fallback the initial merge never happens and remote
+    // changes wait for a reconnect or a visibility change.
+    expect(getPinnedIds().has(7)).toBe(true);
+    expect(
+      startFetch.mock.calls.filter(([, init]) => (init?.method ?? 'GET') === 'GET'),
+    ).toHaveLength(1);
+  });
+
+  it('surfaces a hint storage failure on the debug snapshot', async () => {
+    const original = window.localStorage.setItem.bind(window.localStorage);
+    // Restored by hand rather than by `restoreAllMocks`: happy-dom's
+    // Storage is shared across the suite, so a leaked spy breaks every
+    // later test that writes the hint.
+    const spy = vi
+      .spyOn(window.localStorage, 'setItem')
+      .mockImplementation((key: string, value: string) => {
+        if (key === SYNC_HINT_KEY) {
+          throw new DOMException('QuotaExceededError', 'QuotaExceededError');
+        }
+        original(key, value);
+      });
+    try {
+      const fetchMock = queuedFetch([{ response: jsonResponse(emptyState()) }]);
+      await startCloudSync('alice', { fetchImpl: fetchMock, debounceMs: 0 });
+      await drain();
+    } finally {
+      spy.mockRestore();
+    }
+
+    const failure = getCloudSyncDebug().lastHintFailure;
+    expect(failure?.op).toBe('write');
+    expect(failure?.error).toContain('QuotaExceededError');
+    // …and the spy really is gone, or the next test's hint write is a lie.
+    window.localStorage.setItem(SYNC_HINT_KEY, '1');
+    expect(window.localStorage.getItem(SYNC_HINT_KEY)).toBe('1');
+  });
+
+  it('records the hint after a successful pull, so the next boot primes', async () => {
+    const fetchMock = queuedFetch([
+      { response: jsonResponse(emptyState()) },
+    ]);
+    await startCloudSync('alice', { fetchImpl: fetchMock, debounceMs: 0 });
+    await drain();
+
+    expect(window.localStorage.getItem(SYNC_HINT_KEY)).toBe('1');
+  });
+});
+
+describe('cloudSync debug API', () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+    stopCloudSync();
+    _resetCloudSyncDebugForTests();
+  });
+  afterEach(() => {
+    stopCloudSync();
+    _resetCloudSyncDebugForTests();
+    vi.unstubAllGlobals();
+    window.localStorage.clear();
+  });
+
+  it('reports not-running when sync is stopped', () => {
+    const snap = getCloudSyncDebug();
+    expect(snap.running).toBe(false);
+    expect(snap.username).toBeNull();
+    expect(snap.lastPull).toBeNull();
+    expect(snap.lastPush).toBeNull();
+  });
+
+  it('records lastPull and lastPush with counts after a round-trip', async () => {
+    addPinnedId(1, T.T4);
+    const fetchMock = queuedFetch([
+      {
+        response: jsonResponse({
+          pinned: [{ id: 99, at: T.T1 }],
+          favorite: [],
+          hidden: [],
+        }),
+      }, // GET
+      {
+        response: (init) => {
+          const body = JSON.parse(init?.body as string) as SyncState;
+          return jsonResponse(body);
+        },
+      }, // POST
+    ]);
+
+    await startCloudSync('alice', { fetchImpl: fetchMock, debounceMs: 0 });
+    await drain();
+
+    const snap = getCloudSyncDebug();
+    expect(snap.running).toBe(true);
+    expect(snap.username).toBe('alice');
+    expect(snap.lastPull?.ok).toBe(true);
+    expect(snap.lastPull?.counts).toEqual({
+      pinned: 1,
+      favorite: 0,
+      hidden: 0,
+      done: 0,
+    });
+    expect(snap.lastPush?.ok).toBe(true);
+    expect(snap.lastPush?.counts).toEqual({
+      pinned: 1,
+      favorite: 0,
+      hidden: 0,
+      done: 0,
+    });
+    // High-water is advanced, so pending is empty.
+    expect(snap.pendingCount).toEqual({
+      pinned: 0,
+      favorite: 0,
+      hidden: 0,
+      done: 0,
+    });
+  });
+
+  it('records lastPull.error when the server returns 500', async () => {
+    const fetchMock = queuedFetch([
+      { response: jsonResponse({ error: 'boom' }, 500) },
+    ]);
+    await startCloudSync('alice', { fetchImpl: fetchMock, debounceMs: 0 });
+    await drain();
+    const snap = getCloudSyncDebug();
+    expect(snap.lastPull?.ok).toBe(false);
+    expect(snap.lastPull?.status).toBe(500);
+  });
+
+  it('records lastPush.error when the POST fails', async () => {
+    addPinnedId(1, T.T4);
+    const fetchMock = queuedFetch([
+      { response: jsonResponse({ pinned: [], favorite: [], hidden: [] }) },
+      { response: jsonResponse({ error: 'nope' }, 503) },
+    ]);
+    await startCloudSync('alice', { fetchImpl: fetchMock, debounceMs: 0 });
+    await drain();
+    const snap = getCloudSyncDebug();
+    expect(snap.lastPush?.ok).toBe(false);
+    expect(snap.lastPush?.status).toBe(503);
+    expect(snap.lastPush?.counts).toEqual({
+      pinned: 1,
+      favorite: 0,
+      hidden: 0,
+      done: 0,
+    });
+    // Pending count reflects the still-unpushed entry.
+    expect(snap.pendingCount.pinned).toBe(1);
+  });
+
+  it('subscribeCloudSyncDebug fires on pull/push transitions', async () => {
+    const listener = vi.fn();
+    const unsubscribe = subscribeCloudSyncDebug(listener);
+    try {
+      const fetchMock = queuedFetch([
+        { response: jsonResponse({ pinned: [], favorite: [], hidden: [] }) },
+      ]);
+      await startCloudSync('alice', { fetchImpl: fetchMock, debounceMs: 0 });
+      await drain();
+      expect(listener.mock.calls.length).toBeGreaterThan(0);
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it('pullNow forces a GET without waiting for debounce', async () => {
+    const fetchMock = queuedFetch([
+      { response: jsonResponse({ pinned: [], favorite: [], hidden: [] }) }, // initial start pull
+      {
+        response: jsonResponse({
+          pinned: [{ id: 42, at: T.T4 }],
+          favorite: [],
+          hidden: [],
+        }),
+      }, // manual pullNow
+    ]);
+    await startCloudSync('alice', { fetchImpl: fetchMock, debounceMs: 0 });
+    await drain();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    await pullNow();
+    await drain();
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(getPinnedIds()).toEqual(new Set([42]));
+  });
+
+  it('pullNow is a no-op when sync is stopped', async () => {
+    await pullNow(); // should not throw
+    const snap = getCloudSyncDebug();
+    expect(snap.running).toBe(false);
+  });
+
+  it('pushNow flushes pending deltas immediately, bypassing debounce', async () => {
+    const fetchMock = queuedFetch([
+      { response: jsonResponse({ pinned: [], favorite: [], hidden: [] }) }, // initial GET
+      {
+        response: (init) => {
+          const body = JSON.parse(init?.body as string) as SyncState;
+          return jsonResponse(body);
+        },
+      },
+    ]);
+    await startCloudSync('alice', { fetchImpl: fetchMock, debounceMs: 10_000 });
+    await drain();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    addPinnedId(1, T.T5);
+    // No drain yet — the 10s debounce hasn't fired.
+    await pushNow();
+    await drain();
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const body = JSON.parse(
+      (fetchMock.mock.calls[1][1] as RequestInit).body as string,
+    ) as SyncState;
+    expect(body.pinned).toEqual([{ id: 1, at: T.T5 }]);
+  });
+});
+
+describe('visibility-change pull', () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+    stopCloudSync();
+    _resetCloudSyncDebugForTests();
+  });
+  afterEach(() => {
+    stopCloudSync();
+    _resetCloudSyncDebugForTests();
+    vi.unstubAllGlobals();
+    window.localStorage.clear();
+  });
+
+  function setVisibility(state: 'visible' | 'hidden') {
+    Object.defineProperty(document, 'visibilityState', {
+      configurable: true,
+      get: () => state,
+    });
+    document.dispatchEvent(new Event('visibilitychange'));
+  }
+
+  it('fires a pull when the tab becomes visible again', async () => {
+    const fetchMock = queuedFetch([
+      { response: jsonResponse({ pinned: [], favorite: [], hidden: [] }) }, // initial
+      {
+        response: jsonResponse({
+          pinned: [{ id: 77, at: T.T4 }],
+          favorite: [],
+          hidden: [],
+        }),
+      }, // after visibility
+    ]);
+    await startCloudSync('alice', { fetchImpl: fetchMock, debounceMs: 0 });
+    await drain();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // Tab goes hidden, then visible again — but the gate requires 30s
+    // to have passed since the last pull. Force-rewind the gate.
+    const runtime = _getCloudSyncRuntimeForTests();
+    if (runtime) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (runtime as any).lastPullAttemptAt = 0;
+    }
+    setVisibility('hidden');
+    setVisibility('visible');
+    await drain();
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(getPinnedIds()).toEqual(new Set([77]));
+  });
+
+  it('does not fire a pull when transitioning to hidden', async () => {
+    const fetchMock = queuedFetch([
+      { response: jsonResponse({ pinned: [], favorite: [], hidden: [] }) },
+    ]);
+    await startCloudSync('alice', { fetchImpl: fetchMock, debounceMs: 0 });
+    await drain();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    setVisibility('hidden');
+    await drain();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('flushes a pending debounced push when the tab hides', async () => {
+    const fetchMock = queuedFetch([
+      { response: jsonResponse({ pinned: [], favorite: [], hidden: [] }) }, // initial GET
+      {
+        matcher: (input, init) =>
+          String(input) === '/api/sync' && init?.method === 'POST',
+        response: (init) => {
+          const body = JSON.parse(init?.body as string) as SyncState;
+          return jsonResponse(body);
+        },
+      }, // flushed POST on hide
+    ]);
+    // Long debounce so the timer can't fire on its own — the hide is the
+    // only thing that can send the delta.
+    await startCloudSync('alice', { fetchImpl: fetchMock, debounceMs: 10_000 });
+    await drain();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    addDoneId(42, T.T5); // schedules a push behind the 10s debounce
+    setVisibility('hidden');
+    await drain();
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const body = JSON.parse(
+      (fetchMock.mock.calls[1][1] as RequestInit).body as string,
+    ) as SyncState;
+    expect(body.done).toEqual([{ id: 42, at: T.T5 }]);
+  });
+
+  it('sends the flushed push with keepalive so unload cannot cancel it', async () => {
+    const fetchMock = queuedFetch([
+      { response: jsonResponse({ pinned: [], favorite: [], hidden: [] }) },
+      {
+        response: (init) => {
+          const body = JSON.parse(init?.body as string) as SyncState;
+          return jsonResponse(body);
+        },
+      },
+    ]);
+    await startCloudSync('alice', { fetchImpl: fetchMock, debounceMs: 10_000 });
+    await drain();
+
+    addDoneId(7, T.T5);
+    setVisibility('hidden');
+    await drain();
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect((fetchMock.mock.calls[1][1] as RequestInit).keepalive).toBe(true);
+  });
+
+  it('does not set keepalive on a normal debounced POST', async () => {
+    const fetchMock = queuedFetch([
+      { response: jsonResponse({ pinned: [], favorite: [], hidden: [] }) }, // GET
+      {
+        response: (init) => {
+          const body = JSON.parse(init?.body as string) as SyncState;
+          return jsonResponse(body);
+        },
+      }, // debounced POST
+    ]);
+    await startCloudSync('alice', { fetchImpl: fetchMock, debounceMs: 0 });
+    await drain();
+
+    addDoneId(1, T.T5); // fires via the (zero) debounce, not a hide flush
+    await drain();
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect((fetchMock.mock.calls[1][1] as RequestInit).keepalive).toBeUndefined();
+  });
+
+  it('falls back to a normal POST when the flush delta exceeds the keepalive cap', async () => {
+    const fetchMock = queuedFetch([
+      { response: jsonResponse({ pinned: [], favorite: [], hidden: [] }) }, // GET
+      {
+        response: (init) => {
+          const body = JSON.parse(init?.body as string) as SyncState;
+          return jsonResponse(body);
+        },
+      }, // flushed POST
+    ]);
+    await startCloudSync('alice', { fetchImpl: fetchMock, debounceMs: 10_000 });
+    await drain();
+
+    // Enough Done entries that the serialized delta blows past the ~60 KB
+    // keepalive ceiling (~35 bytes/entry → 2500 entries ≈ 85 KB). Seed in
+    // one bulk write (replaceEntries fires a single change event, which
+    // arms the debounce) — looping addDoneId is O(n²) on localStorage and
+    // times out on CI.
+    replaceDoneEntries(
+      Array.from({ length: 2500 }, (_, i) => ({ id: 1_000_000 + i, at: T.T5 })),
+    );
+    setVisibility('hidden');
+    await drain();
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const init = fetchMock.mock.calls[1][1] as RequestInit;
+    expect((init.body as string).length).toBeGreaterThan(60_000);
+    // Too big for keepalive — must fall back to a plain POST.
+    expect(init.keepalive).toBeUndefined();
+  });
+
+  it('does not POST on hide when there is nothing pending', async () => {
+    const fetchMock = queuedFetch([
+      { response: jsonResponse({ pinned: [], favorite: [], hidden: [] }) },
+    ]);
+    await startCloudSync('alice', { fetchImpl: fetchMock, debounceMs: 0 });
+    await drain();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    setVisibility('hidden'); // no local change scheduled → no-op
+    await drain();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('flushes a pending push on pagehide (bfcache / unload)', async () => {
+    const fetchMock = queuedFetch([
+      { response: jsonResponse({ pinned: [], favorite: [], hidden: [] }) },
+      {
+        response: (init) => {
+          const body = JSON.parse(init?.body as string) as SyncState;
+          return jsonResponse(body);
+        },
+      },
+    ]);
+    await startCloudSync('alice', { fetchImpl: fetchMock, debounceMs: 10_000 });
+    await drain();
+
+    addDoneId(9, T.T5);
+    window.dispatchEvent(new Event('pagehide'));
+    await drain();
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const body = JSON.parse(
+      (fetchMock.mock.calls[1][1] as RequestInit).body as string,
+    ) as SyncState;
+    expect(body.done).toEqual([{ id: 9, at: T.T5 }]);
+  });
+
+  it('does not start a concurrent POST on hide while one is already in flight', async () => {
+    // `/api/sync` merges with a non-atomic get/merge/set, so the client
+    // must never have two POSTs in flight at once — an unload flush racing
+    // the in-flight request could clobber the edit it's meant to save.
+    // When a POST is already in flight the hide is a no-op; the pending
+    // edit stays local and flushes serially once the first POST completes
+    // (on a real unload, on the next app open instead).
+    let releaseFirst!: (r: Response) => void;
+    const firstPost = new Promise<Response>((resolve) => {
+      releaseFirst = resolve;
+    });
+    let posts = 0;
+    const fetchMock = vi.fn(
+      async (_input: RequestInfo | URL, init?: RequestInit) => {
+        if ((init?.method ?? 'GET') === 'GET') {
+          return jsonResponse({ pinned: [], favorite: [], hidden: [] });
+        }
+        posts += 1;
+        if (posts === 1) return firstPost; // hold the first POST in flight
+        return jsonResponse(JSON.parse(init?.body as string) as SyncState);
+      },
+    ) as FetchMock;
+
+    await startCloudSync('alice', { fetchImpl: fetchMock, debounceMs: 0 });
+    await drain();
+
+    // First change → its 0 ms debounce fires → a POST is in flight (gated).
+    addDoneId(1, T.T3);
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    await _flushCloudSyncForTests();
+    expect(posts).toBe(1);
+
+    // Edit behind the in-flight POST, then hide — must NOT fire a 2nd POST.
+    addDoneId(2, T.T4);
+    setVisibility('hidden');
+    await _flushCloudSyncForTests();
+    expect(posts).toBe(1);
+
+    // Releasing the in-flight POST lets the queued edit flush serially.
+    releaseFirst(
+      jsonResponse({
+        pinned: [],
+        favorite: [],
+        hidden: [],
+        done: [{ id: 1, at: T.T3 }],
+      }),
+    );
+    await drain();
+
+    const postBodies = fetchMock.mock.calls
+      .filter((c) => (c[1] as RequestInit | undefined)?.method === 'POST')
+      .map((c) => JSON.parse((c[1] as RequestInit).body as string) as SyncState);
+    expect(posts).toBe(2); // serial, never concurrent
+    expect(postBodies[1].done).toEqual([{ id: 2, at: T.T4 }]);
+  });
+
+  it('gate: two quick visibility→visible transitions only trigger one pull', async () => {
+    const fetchMock = queuedFetch([
+      { response: jsonResponse({ pinned: [], favorite: [], hidden: [] }) }, // initial
+      { response: jsonResponse({ pinned: [], favorite: [], hidden: [] }) }, // first visibility pull
+    ]);
+    await startCloudSync('alice', { fetchImpl: fetchMock, debounceMs: 0 });
+    await drain();
+
+    const runtime = _getCloudSyncRuntimeForTests();
+    if (runtime) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (runtime as any).lastPullAttemptAt = 0;
+    }
+    setVisibility('visible');
+    await drain();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    // Second transition within the gate window — should NOT pull.
+    // (lastPullAttemptAt has been reset to now by the previous pull.)
+    setVisibility('hidden');
+    setVisibility('visible');
+    await drain();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+});

@@ -1,0 +1,412 @@
+import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
+import { act, screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { DebugPage } from './DebugPage';
+import {
+  _resetIdbPersisterForTests,
+  createAppPersister,
+  notePersistRestoreFailure,
+} from '../lib/idbPersister';
+import { renderWithProviders } from '../test/renderUtils';
+import {
+  _resetThreadOpenStatsForTests,
+  noteThreadOpen,
+} from '../lib/threadOpenStats';
+
+interface StatusBody {
+  region: string | null;
+  build: string | null;
+  services: {
+    gemini: { configured: boolean };
+    jina: { configured: boolean };
+    redis: {
+      configured: boolean;
+      reachable?: boolean;
+      latencyMs?: number;
+    };
+    sync?: {
+      configured: boolean;
+      reachable?: boolean;
+      latencyMs?: number;
+    };
+  };
+}
+
+function mockStatus(body: StatusBody | (() => StatusBody), ok = true) {
+  const fetchMock = vi.fn(async () => {
+    const resolved = typeof body === 'function' ? body() : body;
+    return new Response(JSON.stringify(resolved), {
+      status: ok ? 200 : 500,
+      headers: { 'content-type': 'application/json' },
+    });
+  });
+  vi.stubGlobal('fetch', fetchMock);
+  return fetchMock;
+}
+
+describe('<DebugPage>', () => {
+  beforeEach(() => {
+    vi.unstubAllGlobals();
+    _resetIdbPersisterForTests();
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    _resetIdbPersisterForTests();
+  });
+
+  it('reports a failed cache restore, and says nothing when there was none', async () => {
+    // Regression (Codex review on #500): a restore that threw is
+    // discarded-and-refetched exactly like an empty cache, so without
+    // this row the operator can't tell a corrupt blob from a device
+    // that has simply never persisted one.
+    mockStatus({
+      region: 'iad1',
+      build: 'abc1234def5678',
+      services: {
+        gemini: { configured: true },
+        jina: { configured: true },
+        redis: { configured: true },
+      },
+    });
+    const { unmount } = renderWithProviders(<DebugPage />);
+    await waitFor(() => {
+      expect(screen.getByText('Deployment')).toBeInTheDocument();
+    });
+    expect(screen.queryByText(/Cache restore failed/i)).toBeNull();
+    unmount();
+
+    notePersistRestoreFailure(new SyntaxError('bad json'));
+    renderWithProviders(<DebugPage />);
+
+    const alert = await screen.findByText(/Cache restore failed/i);
+    expect(alert).toHaveTextContent('SyntaxError');
+    // The name only — never the message, which can quote the payload.
+    expect(alert).not.toHaveTextContent('bad json');
+  });
+
+  it('renders the deployment and services sections after the fetch resolves', async () => {
+    mockStatus({
+      region: 'iad1',
+      build: 'abc1234def5678',
+      services: {
+        gemini: { configured: true },
+        jina: { configured: false },
+        redis: { configured: true, reachable: true, latencyMs: 4 },
+        sync: { configured: true, reachable: true, latencyMs: 4 },
+      },
+    });
+    renderWithProviders(<DebugPage />, { route: '/debug' });
+
+    expect(
+      screen.getByRole('heading', { level: 1, name: /debug/i }),
+    ).toBeInTheDocument();
+
+    await waitFor(() => {
+      expect(screen.getByText('iad1')).toBeInTheDocument();
+    });
+    // Build SHA is shortened to 7 chars.
+    expect(screen.getByText('abc1234')).toBeInTheDocument();
+
+    // Each service row renders with its own detail string.
+    expect(screen.getByText('Gemini')).toBeInTheDocument();
+    expect(screen.getByText('Jina')).toBeInTheDocument();
+    expect(screen.getByText(/^not configured$/i)).toBeInTheDocument();
+    // Sync is reported separately from Redis so operators can see at
+    // a glance whether cross-device sync will work.
+    expect(screen.getByText('Sync')).toBeInTheDocument();
+  });
+
+  it('renders the persisted-cache stats section outside the status gate', async () => {
+    // Status fetch fails — the cache section must render anyway, since
+    // a device whose boot is slowed by a huge persisted blob is exactly
+    // the one that may struggle to load /api/status too.
+    mockStatus(
+      {
+        region: null,
+        build: null,
+        services: {
+          gemini: { configured: false },
+          jina: { configured: false },
+          redis: { configured: false },
+        },
+      },
+      false,
+    );
+    renderWithProviders(<DebugPage />, { route: '/debug' });
+
+    expect(
+      screen.getByRole('heading', { name: /persisted cache/i }),
+    ).toBeInTheDocument();
+    // Fresh test module state: no restore has run, no snapshots written.
+    expect(screen.getByText(/no persisted cache found/i)).toBeInTheDocument();
+    expect(screen.getByText(/0 written this session/i)).toBeInTheDocument();
+    // The live query census counts the ['debug-status'] query itself —
+    // findBy, since the census only sees it on the post-fetch rerender.
+    expect(await screen.findByText(/debug-status: 1/i)).toBeInTheDocument();
+  });
+
+  it('says no persisted cache found even after an empty restore was timed', async () => {
+    // Regression (Codex review on #512): the restore is timed whether or
+    // not it finds a blob, so keying presence on restoreMs made a fresh
+    // profile read "0 ms" instead of "no persisted cache found".
+    mockStatus({
+      region: null,
+      build: null,
+      services: {
+        gemini: { configured: false },
+        jina: { configured: false },
+        redis: { configured: false },
+      },
+    });
+    // Runs a real restore against an empty backend: restoreMs gets set,
+    // restoredChars stays null.
+    await createAppPersister().restoreClient();
+    renderWithProviders(<DebugPage />, { route: '/debug' });
+    expect(screen.getByText(/no persisted cache found/i)).toBeInTheDocument();
+    expect(screen.queryByText(/^\d+ ms/)).toBeNull();
+  });
+
+  it('lists recent thread opens with wait time and cache provenance', async () => {
+    _resetThreadOpenStatsForTests();
+    mockStatus({
+      region: null,
+      build: null,
+      services: {
+        gemini: { configured: false },
+        jina: { configured: false },
+        redis: { configured: false },
+      },
+    });
+    noteThreadOpen({
+      id: 45678,
+      waitedMs: 1840,
+      rootCached: false,
+      sinceNavMs: 2210,
+    });
+    noteThreadOpen({ id: 999, waitedMs: 3, rootCached: true });
+    renderWithProviders(<DebugPage />, { route: '/debug' });
+    // Newest first, boot-open total appended only where present.
+    expect(
+      screen.getByText(
+        /#999 · 3 ms wait · root cached; #45678 · 1840 ms wait · root not cached · 2210 ms since page load/,
+      ),
+    ).toBeInTheDocument();
+    _resetThreadOpenStatsForTests();
+  });
+
+  it('updates the query census live as queries enter the cache', async () => {
+    // Regression (Codex review on #512): the census was only recomputed
+    // when something else happened to re-render the page, so a query
+    // added while /debug stayed mounted never showed up.
+    mockStatus({
+      region: null,
+      build: null,
+      services: {
+        gemini: { configured: false },
+        jina: { configured: false },
+        redis: { configured: false },
+      },
+    });
+    const { client } = renderWithProviders(<DebugPage />, {
+      route: '/debug',
+    });
+    await screen.findByText(/debug-status: 1/i);
+
+    act(() => {
+      client.setQueryData(['comment', 101], { id: 101 });
+      client.setQueryData(['comment', 102], { id: 102 });
+    });
+    expect(await screen.findByText(/comment: 2/i)).toBeInTheDocument();
+  });
+
+  it('falls back to the Redis status for Sync when the server omits it', async () => {
+    mockStatus({
+      region: null,
+      build: null,
+      services: {
+        gemini: { configured: false },
+        jina: { configured: false },
+        redis: { configured: true, reachable: true, latencyMs: 2 },
+        // sync omitted — simulates an older deployment.
+      },
+    });
+    renderWithProviders(<DebugPage />, { route: '/debug' });
+    await waitFor(() => {
+      expect(screen.getByText('Sync')).toBeInTheDocument();
+    });
+    // The Sync row should surface the same "configured · reachable"
+    // state as Redis, not an empty/unknown line.
+    const syncRow = screen.getByText('Sync').closest('li');
+    expect(syncRow).not.toBeNull();
+    expect(syncRow).toHaveTextContent(/configured · reachable/i);
+  });
+
+
+  it('shows an unreachable Redis cleanly without a latency number', async () => {
+    mockStatus({
+      region: 'iad1',
+      build: null,
+      services: {
+        gemini: { configured: true },
+        jina: { configured: false },
+        redis: { configured: true, reachable: false },
+        sync: { configured: true, reachable: false },
+      },
+    });
+    renderWithProviders(<DebugPage />, { route: '/debug' });
+    await waitFor(() => {
+      // Both the Redis and Sync rows show the unreachable state.
+      expect(
+        screen.getAllByText(/configured · unreachable/i).length,
+      ).toBeGreaterThan(0);
+    });
+    expect(screen.queryByText(/ms/)).not.toBeInTheDocument();
+  });
+
+  it('shows an error state with a retry button when the endpoint fails', async () => {
+    const fetchMock = mockStatus(
+      {
+        region: null,
+        build: null,
+        services: {
+          gemini: { configured: false },
+          jina: { configured: false },
+          redis: { configured: false },
+        },
+      },
+      false,
+    );
+    renderWithProviders(<DebugPage />, { route: '/debug' });
+    await waitFor(() => {
+      expect(screen.getByRole('alert')).toHaveTextContent(
+        /could not load status/i,
+      );
+    });
+    expect(
+      screen.getByRole('button', { name: /retry/i }),
+    ).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalled();
+  });
+
+  it('refetches when the user clicks Refresh', async () => {
+    let call = 0;
+    const fetchMock = mockStatus(() => {
+      call += 1;
+      const latency = call === 1 ? 4 : 9;
+      return {
+        region: 'iad1',
+        build: null,
+        services: {
+          gemini: { configured: true },
+          jina: { configured: false },
+          redis: { configured: true, reachable: true, latencyMs: latency },
+          sync: { configured: true, reachable: true, latencyMs: latency },
+        },
+      };
+    });
+    renderWithProviders(<DebugPage />, { route: '/debug' });
+    await waitFor(() =>
+      expect(screen.getAllByText(/4 ms/).length).toBeGreaterThan(0),
+    );
+    const user = userEvent.setup();
+    await user.click(screen.getByRole('button', { name: /refresh/i }));
+    await waitFor(() =>
+      expect(screen.getAllByText(/9 ms/).length).toBeGreaterThan(0),
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('renders the build commit time and a relative age', async () => {
+    // `vite.config.ts` pins `__BUILD_COMMIT_TIME__` to
+    // TEST_BUILD_COMMIT_TIME under Vitest so this test is deterministic
+    // regardless of whether the checkout has git metadata. The fallback
+    // (empty string → "unknown") is covered by the next test, which
+    // mocks `../lib/buildInfo` directly.
+    vi.useFakeTimers();
+    // Pin "now" 2 hours after the fixed commit time so the relative age
+    // is a stable "2h ago".
+    vi.setSystemTime(new Date('2026-01-01T02:00:00.000Z'));
+
+    mockStatus({
+      region: 'iad1',
+      build: 'abc1234def5678',
+      services: {
+        gemini: { configured: false },
+        jina: { configured: false },
+        redis: { configured: false },
+        sync: { configured: false },
+      },
+    });
+    renderWithProviders(<DebugPage />, { route: '/debug' });
+
+    await vi.waitFor(() => {
+      expect(screen.getByText('Built')).toBeInTheDocument();
+    });
+    const builtRow = screen.getByText('Built').closest('div');
+    expect(builtRow).not.toBeNull();
+    const timeEl = builtRow!.querySelector('time');
+    expect(timeEl).not.toBeNull();
+    expect(timeEl!.getAttribute('datetime')).toBe('2026-01-01T00:00:00.000Z');
+    expect(builtRow!.textContent).toMatch(/\(2h ago\)/);
+
+    vi.useRealTimers();
+  });
+
+  it('shows "unknown" when the build commit time is empty', async () => {
+    // Covers the deploy scenario where the Vite build ran without git
+    // metadata (shallow checkout, missing .git, etc.) and
+    // `readCommitTime()` fell back to ''. We mock the module rather
+    // than the compile-time define because the define is substituted
+    // at transform time — there's no runtime hook to stub.
+    vi.resetModules();
+    vi.doMock('../lib/buildInfo', () => ({ buildCommitTime: '' }));
+    const { DebugPage: DebugPageWithEmptyBuild } = await import('./DebugPage');
+
+    mockStatus({
+      region: 'iad1',
+      build: null,
+      services: {
+        gemini: { configured: false },
+        jina: { configured: false },
+        redis: { configured: false },
+        sync: { configured: false },
+      },
+    });
+    renderWithProviders(<DebugPageWithEmptyBuild />, { route: '/debug' });
+
+    await waitFor(() => {
+      expect(screen.getByText('Built')).toBeInTheDocument();
+    });
+    const builtRow = screen.getByText('Built').closest('div');
+    expect(builtRow).not.toBeNull();
+    // No <time> element, and the dd contains the italic "unknown".
+    expect(builtRow!.querySelector('time')).toBeNull();
+    expect(builtRow!.textContent).toMatch(/unknown/);
+
+    vi.doUnmock('../lib/buildInfo');
+    vi.resetModules();
+  });
+
+  it('renders the back-to-Top link', async () => {
+    mockStatus({
+      region: null,
+      build: null,
+      services: {
+        gemini: { configured: false },
+        jina: { configured: false },
+        redis: { configured: false },
+      },
+    });
+    renderWithProviders(<DebugPage />, { route: '/debug' });
+    // Wait for the fetch to resolve (the Services heading only renders
+    // after data is available).
+    await waitFor(() =>
+      expect(
+        screen.getByRole('heading', { level: 2, name: /services/i }),
+      ).toBeInTheDocument(),
+    );
+    expect(
+      screen.getByRole('link', { name: /back to top/i }),
+    ).toHaveAttribute('href', '/top');
+  });
+});

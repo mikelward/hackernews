@@ -1,0 +1,40 @@
+import { createPersistentValue } from './persistentValue';
+
+export const HOME_FEED_STORAGE_KEY = 'newshacker:homeFeed';
+export const HOME_FEED_CHANGE_EVENT = 'newshacker:homeFeedChanged';
+
+// What `/` renders. The URL itself is fixed — see SPEC.md *Story
+// feeds → /hot* — only the rendered feed varies. `top` is the
+// shipping default; `hot` promotes the heavily-filtered Top ∪ New
+// view to the home slot. Deep links like `/top` and `/hot` stay
+// explicit routes for shareability.
+export type HomeFeed = 'top' | 'hot';
+
+const HOME_FEEDS: readonly HomeFeed[] = ['top', 'hot'];
+
+export const DEFAULT_HOME_FEED: HomeFeed = 'top';
+
+// Picker options (value + label), shared by the drawer's Home picker and the
+// Settings page so the two stay in lockstep.
+export const HOME_FEED_OPTIONS: Array<{ value: HomeFeed; label: string }> = [
+  { value: 'top', label: 'Top' },
+  { value: 'hot', label: 'Hot' },
+];
+
+function isHomeFeed(value: unknown): value is HomeFeed {
+  return (
+    typeof value === 'string' &&
+    (HOME_FEEDS as readonly string[]).includes(value)
+  );
+}
+
+export const homeFeedStore = createPersistentValue<HomeFeed>({
+  storageKey: HOME_FEED_STORAGE_KEY,
+  changeEvent: HOME_FEED_CHANGE_EVENT,
+  defaultValue: DEFAULT_HOME_FEED,
+  parse: (raw) => (isHomeFeed(raw) ? raw : undefined),
+  detailKey: 'feed',
+});
+
+export const getStoredHomeFeed = homeFeedStore.get;
+export const setStoredHomeFeed = homeFeedStore.set;

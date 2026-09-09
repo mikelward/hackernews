@@ -1,0 +1,143 @@
+.app-drawer {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+}
+
+.app-drawer__scrim {
+  position: absolute;
+  inset: 0;
+  border: none;
+  padding: 0;
+  margin: 0;
+  background: rgba(0, 0, 0, 0.4);
+  cursor: pointer;
+}
+
+.app-drawer__panel {
+  position: relative;
+  z-index: 1;
+  width: min(80vw, 320px);
+  height: 100%;
+  background: var(--nh-bg);
+  border-right: 1px solid var(--nh-border);
+  overflow-y: auto;
+  padding: 16px 12px;
+  box-shadow: 1px 0 6px rgba(0, 0, 0, 0.15);
+}
+
+.app-drawer__close {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  min-width: var(--tap-min);
+  min-height: var(--tap-min);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  color: var(--nh-meta);
+  font-size: 28px;
+  line-height: 1;
+  padding: 0;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+@media (hover: hover) {
+  .app-drawer__close:hover {
+    background: var(--nh-pressed);
+  }
+}
+
+.app-drawer__close:active {
+  background: var(--nh-border);
+}
+
+.app-drawer__section-title {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--nh-meta);
+  margin: 12px 8px 4px;
+}
+
+.app-drawer__list {
+  list-style: none;
+  margin: 0 0 12px;
+  padding: 0;
+}
+
+.app-drawer__link {
+  display: flex;
+  align-items: center;
+  min-height: var(--tap-min);
+  padding: 10px 12px;
+  border-radius: 6px;
+  color: var(--nh-text);
+  text-decoration: none;
+  font-size: 15px;
+  font-weight: 500;
+}
+
+@media (hover: hover) {
+  .app-drawer__link:hover {
+    text-decoration: none;
+    background: var(--nh-pressed);
+  }
+}
+
+.app-drawer__link:active {
+  background: var(--nh-border);
+}
+
+.app-drawer__segmented {
+  display: flex;
+  gap: 4px;
+  margin: 0 8px 12px;
+  padding: 4px;
+  background: var(--nh-bg-code);
+  border: 1px solid var(--nh-border);
+  border-radius: 8px;
+}
+
+.app-drawer__segmented-btn {
+  flex: 1 1 0;
+  min-height: var(--tap-min);
+  padding: 8px 4px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  color: var(--nh-text);
+}
+
+.app-drawer__segmented-btn--text {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+/* The capital "A" of the text-size picker. The per-button inline font-size
+   (px, not rem) sets the scale hint and stays fixed regardless of the chosen
+   reading size; line-height: 1 keeps each "A" centered in the shared button. */
+.app-drawer__size-glyph {
+  font-weight: 700;
+  line-height: 1;
+}
+
+.app-drawer__segmented-btn[data-active] {
+  background: var(--nh-bg-card);
+  color: var(--nh-orange);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+}
+
+@media (hover: hover) {
+  .app-drawer__segmented-btn:not([data-active]):hover {
+    background: var(--nh-pressed);
+  }
+}

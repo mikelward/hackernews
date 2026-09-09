@@ -1,0 +1,198 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { act, fireEvent, screen, waitFor } from '@testing-library/react';
+import { OpenedPage } from './OpenedPage';
+import { renderWithProviders } from '../test/renderUtils';
+import { installHNFetchMock, makeStory } from '../test/mockFetch';
+import { addOpenedId } from '../lib/openedStories';
+
+describe('<OpenedPage>', () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+  });
+  afterEach(() => {
+    window.localStorage.clear();
+    vi.restoreAllMocks();
+  });
+
+  it('shows an empty state when nothing is opened', () => {
+    installHNFetchMock({ items: {} });
+    renderWithProviders(<OpenedPage />);
+    expect(
+      screen.getByText(/haven't opened any stories/i),
+    ).toBeInTheDocument();
+  });
+
+  it('lists opened stories newest first', async () => {
+    installHNFetchMock({
+      items: {
+        11: makeStory(11, { title: 'Eleven' }),
+        22: makeStory(22, { title: 'Twenty-two' }),
+      },
+    });
+    const now = Date.now();
+    addOpenedId(11, now - 2000);
+    addOpenedId(22, now - 1000);
+
+    renderWithProviders(<OpenedPage />);
+    await waitFor(() => {
+      expect(screen.getAllByTestId('story-row')).toHaveLength(2);
+    });
+    const rows = screen.getAllByTestId('story-row');
+    expect(rows[0]).toHaveTextContent('Twenty-two');
+    expect(rows[1]).toHaveTextContent('Eleven');
+  });
+
+  it('does not show a Forget all button when nothing is opened', () => {
+    installHNFetchMock({ items: {} });
+    renderWithProviders(<OpenedPage />);
+    expect(
+      screen.queryByRole('button', { name: /forget all opened/i }),
+    ).toBeNull();
+  });
+
+  it('Forget all clears opened history after confirmation', async () => {
+    installHNFetchMock({
+      items: {
+        11: makeStory(11, { title: 'Eleven' }),
+        22: makeStory(22, { title: 'Twenty-two' }),
+      },
+    });
+    addOpenedId(11);
+    addOpenedId(22);
+    const confirmSpy = vi.fn(() => true);
+    vi.stubGlobal('confirm', confirmSpy);
+
+    renderWithProviders(<OpenedPage />);
+    await waitFor(() => {
+      expect(screen.getByText('Eleven')).toBeInTheDocument();
+    });
+
+    act(() => {
+      fireEvent.click(
+        screen.getByRole('button', { name: /forget all opened/i }),
+      );
+    });
+
+    expect(confirmSpy).toHaveBeenCalledWith(
+      expect.stringMatching(/forget all 2 opened stories/i),
+    );
+    await waitFor(() => {
+      expect(
+        screen.getByText(/haven't opened any stories/i),
+      ).toBeInTheDocument();
+    });
+    expect(
+      window.localStorage.getItem('newshacker:openedStoryIds'),
+    ).toBe('[]');
+  });
+
+  it('Forget all is a no-op when the user cancels', async () => {
+    installHNFetchMock({
+      items: { 7: makeStory(7, { title: 'Seven' }) },
+    });
+    addOpenedId(7);
+    vi.stubGlobal('confirm', vi.fn(() => false));
+
+    renderWithProviders(<OpenedPage />);
+    await waitFor(() => {
+      expect(screen.getByText('Seven')).toBeInTheDocument();
+    });
+
+    act(() => {
+      fireEvent.click(
+        screen.getByRole('button', { name: /forget all opened/i }),
+      );
+    });
+
+    expect(screen.getByText('Seven')).toBeInTheDocument();
+  });
+
+  it('Forget all does not touch hidden or pinned stores', async () => {
+    installHNFetchMock({
+      items: { 7: makeStory(7, { title: 'Seven' }) },
+    });
+    addOpenedId(7);
+    window.localStorage.setItem(
+      'newshacker:hiddenStoryIds',
+      JSON.stringify([{ id: 88, at: Date.now() }]),
+    );
+    window.localStorage.setItem(
+      'newshacker:pinnedStoryIds',
+      JSON.stringify([{ id: 99, at: Date.now() }]),
+    );
+    vi.stubGlobal('confirm', vi.fn(() => true));
+
+    renderWithProviders(<OpenedPage />);
+    await waitFor(() => {
+      expect(screen.getByText('Seven')).toBeInTheDocument();
+    });
+
+    act(() => {
+      fireEvent.click(
+        screen.getByRole('button', { name: /forget all opened/i }),
+      );
+    });
+
+    await waitFor(() => {
+      expect(
+        screen.getByText(/haven't opened any stories/i),
+      ).toBeInTheDocument();
+    });
+    const hidden = window.localStorage.getItem(
+      'newshacker:hiddenStoryIds',
+    );
+    const pinned = window.localStorage.getItem('newshacker:pinnedStoryIds');
+    expect(JSON.parse(hidden as string)).toHaveLength(1);
+    expect(JSON.parse(pinned as string)).toHaveLength(1);
+  });
+
+  it('renders opened rows with the opened modifier class', async () => {
+    installHNFetchMock({
+      items: { 7: makeStory(7, { title: 'Seven' }) },
+    });
+    addOpenedId(7);
+
+    renderWithProviders(<OpenedPage />);
+    await waitFor(() => {
+      expect(screen.getByTestId('story-row')).toBeInTheDocument();
+    });
+    const className = screen.getByTestId('story-row').className;
+    expect(className).toContain('story-row--opened');
+  });
+
+  it('long-press Mark unread removes a story from /opened', async () => {
+    installHNFetchMock({
+      items: { 7: makeStory(7, { title: 'Seven' }) },
+    });
+    addOpenedId(7);
+
+    renderWithProviders(<OpenedPage />);
+    await waitFor(() => {
+      expect(screen.getByText('Seven')).toBeInTheDocument();
+    });
+
+    vi.useFakeTimers();
+
+    const row = screen.getByTestId('story-row');
+    const down = new Event('pointerdown', { bubbles: true, cancelable: true });
+    Object.assign(down, {
+      pointerId: 1,
+      pointerType: 'touch',
+      clientX: 100,
+      clientY: 100,
+      button: 0,
+      isPrimary: true,
+    });
+    act(() => {
+      row.dispatchEvent(down);
+      vi.advanceTimersByTime(600);
+    });
+
+    const markUnread = screen.getByTestId('story-row-menu-mark-unread');
+    expect(markUnread).toHaveTextContent('Mark unread');
+    fireEvent.click(markUnread);
+
+    expect(screen.getByText(/haven't opened any stories/i)).toBeInTheDocument();
+    vi.useRealTimers();
+  });
+});

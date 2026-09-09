@@ -1,0 +1,196 @@
+// @vitest-environment node
+import { describe, expect, it, vi } from 'vitest';
+import { QueryClient } from '@tanstack/react-query';
+import {
+  _resetInFlightBatchForTests,
+  getInFlightBatchComment,
+  prefetchCommentBatch,
+  COMMENT_BATCH_LIMIT,
+} from './commentPrefetch';
+import type { HNItem } from './hn';
+
+function makeComment(id: number): HNItem {
+  return {
+    id,
+    type: 'comment',
+    by: 'alice',
+    text: `comment ${id}`,
+    time: 1_700_000_000,
+    kids: [],
+  };
+}
+
+function newClient() {
+  return new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+}
+
+describe('prefetchCommentBatch', () => {
+  it('writes each fetched comment to the ["comment", id] key so useCommentItem hydrates from cache', async () => {
+    const fetcher = vi.fn(async (ids: number[]) => ids.map(makeComment));
+    const client = newClient();
+
+    await prefetchCommentBatch(client, [10, 20, 30], fetcher);
+
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(fetcher).toHaveBeenCalledWith([10, 20, 30], expect.any(AbortSignal), {
+      fields: 'full',
+    });
+    expect(client.getQueryData(['comment', 10])).toMatchObject({ id: 10 });
+    expect(client.getQueryData(['comment', 20])).toMatchObject({ id: 20 });
+    expect(client.getQueryData(['comment', 30])).toMatchObject({ id: 30 });
+  });
+
+  it('passes a timeout signal so a hung batch cannot block the caller indefinitely', async () => {
+    let seenSignal: AbortSignal | undefined;
+    const fetcher = vi.fn(
+      async (ids: number[], signal?: AbortSignal) => {
+        seenSignal = signal;
+        return ids.map(makeComment);
+      },
+    );
+    const client = newClient();
+
+    await prefetchCommentBatch(client, [10], fetcher);
+
+    // The deadline itself comes from AbortSignal.timeout — asserting the
+    // signal is wired through (and not already fired) is the part this
+    // module owns; the abort -> rejection -> swallow path is covered by
+    // the fetcher-error test above.
+    expect(seenSignal).toBeInstanceOf(AbortSignal);
+    expect(seenSignal?.aborted).toBe(false);
+  });
+
+  it('caps the request at the top-level limit (single batch, no mega-thread burst)', async () => {
+    const many = Array.from({ length: 120 }, (_, i) => i + 1);
+    const fetcher = vi.fn(async (ids: number[]) => ids.map(makeComment));
+    const client = newClient();
+
+    await prefetchCommentBatch(client, many, fetcher);
+
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    const requestedIds = fetcher.mock.calls[0][0] as number[];
+    expect(requestedIds).toHaveLength(COMMENT_BATCH_LIMIT);
+    expect(requestedIds[0]).toBe(1);
+    expect(requestedIds[requestedIds.length - 1]).toBe(
+      COMMENT_BATCH_LIMIT,
+    );
+  });
+
+  it('no-ops when there are no top-level kids', async () => {
+    const fetcher = vi.fn(async () => []);
+    const client = newClient();
+
+    await prefetchCommentBatch(client, [], fetcher);
+
+    expect(fetcher).not.toHaveBeenCalled();
+    expect(client.getQueryCache().findAll()).toHaveLength(0);
+  });
+
+  it('skips null entries (deleted / unknown ids) without crashing', async () => {
+    const fetcher = vi.fn(async (ids: number[]) =>
+      ids.map((id) => (id === 2 ? null : makeComment(id))),
+    );
+    const client = newClient();
+
+    await prefetchCommentBatch(client, [1, 2, 3], fetcher);
+
+    expect(client.getQueryData(['comment', 1])).toMatchObject({ id: 1 });
+    expect(client.getQueryData(['comment', 2])).toBeUndefined();
+    expect(client.getQueryData(['comment', 3])).toMatchObject({ id: 3 });
+  });
+
+  it('swallows fetcher errors so pinning is never blocked by a prefetch failure', async () => {
+    const fetcher = vi.fn(async () => {
+      throw new Error('offline');
+    });
+    const client = newClient();
+
+    await expect(
+      prefetchCommentBatch(client, [1, 2, 3], fetcher),
+    ).resolves.toBeUndefined();
+    expect(client.getQueryData(['comment', 1])).toBeUndefined();
+  });
+
+  it('overwrites existing cached comment data on a subsequent batch so edits and deletions surface on root refetch', async () => {
+    const client = newClient();
+
+    const firstFetcher = async (ids: number[]): Promise<Array<HNItem | null>> =>
+      ids.map((id) => ({ ...makeComment(id), text: `original ${id}` }));
+    await prefetchCommentBatch(client, [42], firstFetcher);
+    expect(client.getQueryData<HNItem>(['comment', 42])?.text).toBe(
+      'original 42',
+    );
+
+    const secondFetcher = async (ids: number[]): Promise<Array<HNItem | null>> =>
+      ids.map((id) => ({ ...makeComment(id), text: `edited ${id}` }));
+    await prefetchCommentBatch(client, [42], secondFetcher);
+
+    expect(client.getQueryData<HNItem>(['comment', 42])?.text).toBe(
+      'edited 42',
+    );
+  });
+
+  it('preserves kids on cached comments so offline UI shows accurate reply counts', async () => {
+    const fetcher = async (ids: number[]): Promise<Array<HNItem | null>> =>
+      ids.map((id) => ({
+        id,
+        type: 'comment',
+        by: 'bob',
+        text: `comment ${id}`,
+        time: 1,
+        kids: [id * 10, id * 10 + 1],
+      }));
+    const client = newClient();
+
+    await prefetchCommentBatch(client, [5], fetcher);
+
+    const cached = client.getQueryData<HNItem>(['comment', 5]);
+    expect(cached?.kids).toEqual([50, 51]);
+  });
+
+  it('registers in-flight slots synchronously and clears them only after the cache writes land', async () => {
+    // Thread load fires the batch without awaiting it, so observers that
+    // mount mid-batch join via these slots. Clearing before the cache
+    // writes would open a window with no slot AND no cache — the
+    // stampede this registry exists to prevent.
+    _resetInFlightBatchForTests();
+    const client = newClient();
+    let release!: (items: Array<HNItem | null>) => void;
+    const gate = new Promise<Array<HNItem | null>>((resolve) => {
+      release = resolve;
+    });
+    const fetcher = vi.fn(async () => gate);
+
+    const done = prefetchCommentBatch(client, [7, 8], fetcher);
+    // Registered synchronously, before the fetch resolves.
+    const slot7 = getInFlightBatchComment(7);
+    expect(slot7).toBeDefined();
+    expect(getInFlightBatchComment(8)).toBeDefined();
+
+    release([makeComment(7), makeComment(8)]);
+    await expect(slot7).resolves.toMatchObject({ id: 7 });
+    await done;
+    // After the awaited prefetch resolves the cache is populated and
+    // the slots are gone.
+    expect(client.getQueryData<HNItem>(['comment', 7])?.id).toBe(7);
+    expect(getInFlightBatchComment(7)).toBeUndefined();
+    expect(getInFlightBatchComment(8)).toBeUndefined();
+  });
+
+  it('resolves joined slots to null on batch failure so observers fall back to single fetches', async () => {
+    _resetInFlightBatchForTests();
+    const client = newClient();
+    const fetcher = vi.fn(async () => {
+      throw new Error('batch down');
+    });
+    const done = prefetchCommentBatch(client, [9], fetcher);
+    const slot = getInFlightBatchComment(9);
+    expect(slot).toBeDefined();
+    await expect(slot).resolves.toBeNull();
+    await done;
+    expect(getInFlightBatchComment(9)).toBeUndefined();
+    expect(client.getQueryData(['comment', 9])).toBeUndefined();
+  });
+});

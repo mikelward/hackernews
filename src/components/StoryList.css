@@ -1,0 +1,302 @@
+.story-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.story-list__item {
+  position: relative;
+  /* Clip the swipe-hint labels (rendered as siblings of the row's
+     <article>) so they only peek out as the row translates under a
+     swipe. See `.story-row__swipe-hint` in StoryListItem.css. */
+  overflow: hidden;
+  background: var(--nh-bg-card);
+  border-bottom: 1px solid var(--nh-border);
+}
+
+/* Sweep animation: every unpinned, fully-visible row slides+fades out
+   together when the broom fires, matching the single-gesture verb.
+   Tuned to match `useSwipeToDismiss` exactly — 200ms ease-out,
+   translate the row off to the right by its full width (so it leaves
+   the viewport the same way a manually swiped row does), opacity to
+   0. Direction matches swipe-right-to-hide so the row leaves the way
+   a manually dismissed row leaves. The JS handler in StoryList.tsx
+   holds the actual hide call until this animation completes
+   (SWEEP_ANIMATION_MS), so the row slides in place rather than
+   popping. Reduced-motion readers skip the animation in CSS and the
+   delay in JS — the hide is instant for them. */
+@keyframes story-list__sweep-out {
+  from {
+    opacity: 1;
+    transform: translate3d(0, 0, 0);
+  }
+  to {
+    opacity: 0;
+    transform: translate3d(100%, 0, 0);
+  }
+}
+
+.story-list__item--sweeping {
+  animation: story-list__sweep-out 200ms ease-out forwards;
+  pointer-events: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .story-list__item--sweeping {
+    animation: none;
+  }
+}
+
+/* Bottom action bar — visually mirrors `.list-toolbar` (compact 40×40
+   icon buttons, --nh-bg-card background). Sits at the end of the list
+   as if it were another row — no sticky/fixed positioning, so the
+   reader scrolls past it the same way they scroll past the last story.
+   The last `.story-list__item` already carries a `border-bottom`, so
+   that line serves as the divider — adding our own `border-top` would
+   double up. (Mirrors `.list-toolbar`, which has only its
+   `border-bottom` and relies on the first story's lack of border-top
+   to avoid the same doubling.) */
+.story-list__footer {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  background: var(--nh-bg-card);
+}
+
+/* Opt-in sticky bottom bar (newshacker:stickyBottomBar): pin the action bar to
+   the foot of the viewport so Back to top / More / Undo / Sweep stay in reach
+   without scrolling to the end. `position: sticky` reserves the bar's flow space
+   at the list end (no padding hack needed) and sticks it to the bottom while
+   content scrolls underneath. A top border separates it from a row it overlaps;
+   the Sweep observer excludes rows behind it via useStickyFooterInset. */
+.story-list__footer--sticky {
+  position: sticky;
+  bottom: 0;
+  z-index: 8;
+  border-top: 1px solid var(--nh-border);
+  padding-bottom: max(4px, env(safe-area-inset-bottom));
+}
+
+/* Compact transparent icon button — same shape as `.list-toolbar__button`
+   (40×40, borderless, hover/pressed background, disabled fade). Back to
+   top sits on the left, Sweep on the right (pinned via margin-left:auto
+   on the wrapping `<div>`); both are icon-only. */
+.back-to-top-btn--icon,
+.list-footer__icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  color: var(--nh-text);
+  cursor: pointer;
+}
+
+.back-to-top-btn--icon:focus-visible,
+.list-footer__icon-btn:focus-visible {
+  outline: 2px solid var(--nh-orange);
+  outline-offset: 1px;
+}
+
+@media (hover: hover) {
+  .back-to-top-btn--icon:not([aria-disabled='true']):hover,
+  .list-footer__icon-btn:not([aria-disabled='true']):hover {
+    background: var(--nh-bg);
+  }
+}
+
+.back-to-top-btn--icon:not([aria-disabled='true']):active,
+.list-footer__icon-btn:not([aria-disabled='true']):active {
+  background: var(--nh-bg);
+}
+
+/* TooltipButtons go inert via aria-disabled (not the native `disabled`
+   attribute) so their tooltip still shows on hover/long-press. */
+.list-footer__icon-btn[aria-disabled='true'] {
+  color: var(--nh-meta);
+  cursor: default;
+}
+
+/* Library/offline footer's labeled Back to top stays full-width (no
+   More or Sweep to share the row). Reuses the same compact bar
+   container but stretches a single labeled button across it. */
+.back-to-top-btn:not(.back-to-top-btn--icon) {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+  min-height: 40px;
+  padding: 8px 16px;
+  background: transparent;
+  border: 1px solid var(--nh-border);
+  border-radius: 6px;
+  color: var(--nh-text);
+  /* Action control — stays px so the Text size setting doesn't scale it. */
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+@media (hover: hover) {
+  .back-to-top-btn:not(.back-to-top-btn--icon):hover {
+    background: var(--nh-bg);
+  }
+}
+
+.back-to-top-btn:not(.back-to-top-btn--icon):active {
+  background: var(--nh-bg);
+}
+
+/* More button — text label that stretches to fill the row's middle.
+   It's the primary action on a feed bar (reveal the next page), so
+   it gets the biggest target by absorbing free space between the
+   icon-only Back to top and Sweep buttons. */
+.load-more-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+  min-height: 40px;
+  padding: 8px 16px;
+  background: transparent;
+  border: 1px solid var(--nh-border);
+  border-radius: 6px;
+  color: var(--nh-text);
+  /* Action control — stays px so the Text size setting doesn't scale it. */
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+@media (hover: hover) {
+  .load-more-btn:hover:not(:disabled) {
+    background: var(--nh-bg);
+  }
+}
+
+.load-more-btn:active:not(:disabled) {
+  background: var(--nh-bg);
+}
+
+.load-more-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+/* Right-aligned action group: Undo + Sweep, mirroring the top
+   toolbar's `.list-toolbar__right` shape. Hugging the trailing edge
+   via `margin-left: auto` keeps the group stable no matter what sits
+   between it and Back to top (More present or absent). */
+.story-list__footer-right {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.list-footer__icon {
+  display: block;
+}
+
+/* Feed refresh status strip — sits at the foot of the list, just above
+   the More / Back-to-top row, when a background refresh is in flight or has
+   failed, so opening the app after a while doesn't silently leave the
+   reader on a stale snapshot. */
+.feed-refresh {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  padding: 8px 12px;
+  font-size: 0.85rem;
+  /* Theme vars, not literals — hardcoded light values rendered as a
+     bright beige band in dark mode. */
+  color: var(--nh-meta);
+  background: var(--nh-bg-code);
+  border-top: 1px solid var(--nh-border);
+}
+
+.feed-refresh--failed {
+  color: #8a3b00;
+  background: #fbe9dd;
+  border-top-color: #f0cdb6;
+}
+
+/* Dark equivalents of the failed strip; same double-selector pattern
+   as the token blocks in global.css (explicit data-theme choice wins,
+   OS preference fills in when no choice is stored). */
+:root[data-theme='dark'] .feed-refresh--failed {
+  color: #f0a979;
+  background: #3a2417;
+  border-top-color: #57341f;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) .feed-refresh--failed {
+    color: #f0a979;
+    background: #3a2417;
+    border-top-color: #57341f;
+  }
+}
+
+.feed-refresh__msg {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.feed-refresh__spinner {
+  width: 14px;
+  height: 14px;
+  flex: none;
+  border: 2px solid rgba(239, 95, 0, 0.25);
+  border-top-color: #ef5f00;
+  border-radius: 50%;
+  animation: feed-refresh-spin 0.7s linear infinite;
+}
+
+@keyframes feed-refresh-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .feed-refresh__spinner {
+    animation: none;
+  }
+}
+
+.feed-refresh__retry {
+  min-height: 44px;
+  min-width: 44px;
+  padding: 0 14px;
+  border: 1px solid currentColor;
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+@media (hover: hover) {
+  .feed-refresh__retry:hover {
+    background: rgba(138, 59, 0, 0.08);
+  }
+}
+
+.feed-refresh__retry:active {
+  background: rgba(138, 59, 0, 0.16);
+}

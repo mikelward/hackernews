@@ -1,0 +1,21 @@
+{
+  "ignoreCommand": "node scripts/vercel-ignore.mjs",
+  "outputDirectory": "dist",
+  "rewrites": [
+    {
+      "source": "/item/:id",
+      "has": [
+        {
+          "type": "header",
+          "key": "user-agent",
+          "value": "(?i)(whatsapp/.*|.*(facebookexternalhit|facebookcatalog|twitterbot|slackbot|discordbot|telegrambot|linkedinbot|skypeuripreview|embedly|redditbot|bluesky|applebot|googlebot|bingbot|duckduckbot|yandex|baiduspider|vkshare|w3c_validator|opengraph).*)"
+        }
+      ],
+      "destination": "/api/og?id=:id"
+    },
+    { "source": "/((?!api/|assets/).*)", "destination": "/index.html" }
+  ],
+  "crons": [
+    { "path": "/api/warm-summaries?feed=top&n=30", "schedule": "*/5 * * * *" }
+  ]
+}

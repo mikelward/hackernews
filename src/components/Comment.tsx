@@ -1,0 +1,313 @@
+import { useState } from 'react';
+import { Link } from 'react-router';
+import { useQueryClient } from '@tanstack/react-query';
+import { useCommentItem } from '../hooks/useItemTree';
+import { useInternalLinkClick } from '../hooks/useInternalLinkClick';
+import { useVote } from '../hooks/useVote';
+import { prefetchCommentBatch } from '../lib/commentPrefetch';
+import { formatTimeAgo, pluralize } from '../lib/format';
+import { getItems } from '../lib/hn';
+import { sanitizeCommentHtml } from '../lib/sanitize';
+import { TooltipButton } from './TooltipButton';
+import './Comment.css';
+
+const MS_VIEWBOX = '0 -960 960 960';
+
+function ToolbarUpArrowIcon() {
+  return (
+    <svg
+      viewBox={MS_VIEWBOX}
+      fill="currentColor"
+      width="22"
+      height="22"
+      aria-hidden="true"
+      focusable="false"
+    >
+      <path d="M480-720 220-320h520L480-720Z" />
+    </svg>
+  );
+}
+
+function ToolbarDownArrowIcon() {
+  return (
+    <svg
+      viewBox={MS_VIEWBOX}
+      fill="currentColor"
+      width="22"
+      height="22"
+      aria-hidden="true"
+      focusable="false"
+    >
+      <path d="M480-240 220-640h520L480-240Z" />
+    </svg>
+  );
+}
+
+function ToolbarReplyIcon() {
+  return (
+    <svg
+      viewBox={MS_VIEWBOX}
+      fill="currentColor"
+      width="22"
+      height="22"
+      aria-hidden="true"
+      focusable="false"
+    >
+      <path d="M760-200v-160q0-50-35-85t-85-35H273l144 144-57 57-241-241 241-241 57 57-144 144h367q83 0 141.5 58.5T840-360v160h-80Z" />
+    </svg>
+  );
+}
+
+// Height-reserving stand-in for a top-level comment whose body hasn't
+// been fetched yet. The thread renders one of these for every
+// not-yet-loaded top-level kid so the full row count — and therefore
+// the scroll height — is established at load time instead of growing
+// as the reader scrolls and successive pages mount. `min-height`
+// approximates a typical collapsed comment (body + 36px footer) so the
+// real card swapping in causes only a small, off-screen reflow rather
+// than appending fresh height at the bottom. aria-hidden because it
+// carries no content for assistive tech to announce.
+export function CommentPlaceholder() {
+  return (
+    <div className="comment comment--placeholder" aria-hidden="true">
+      <div className="comment__placeholder-body">
+        <span className="comment__placeholder-line" />
+        <span className="comment__placeholder-line" />
+      </div>
+      <div className="comment__footer">
+        <span className="comment__placeholder-meta" />
+      </div>
+    </div>
+  );
+}
+
+interface Props {
+  id: number;
+  // Start the comment in its expanded state instead of the default
+  // collapsed-with-3-line-preview. Set on the focused-comment view at
+  // /item/<commentId> where the reader specifically came to read this
+  // comment — the toggle still works in both directions afterward, so
+  // they can collapse it if they want.
+  defaultExpanded?: boolean;
+}
+
+export function Comment({ id, defaultExpanded = false }: Props) {
+  const [isExpanded, setIsExpanded] = useState(defaultExpanded);
+  const { data: item, isLoading, isFetching, refetch } = useCommentItem(id);
+  const handleLinkClick = useInternalLinkClick();
+  const queryClient = useQueryClient();
+  const { isVoted, isDownvoted, toggleVote, toggleDownvote } = useVote();
+  const voted = isVoted(id);
+  const downvoted = isDownvoted(id);
+
+  if (!item) {
+    if (isLoading || isFetching) {
+      return (
+        <div
+          className="comment comment--loading"
+          aria-busy="true"
+        >
+          <div className="comment__footer">
+            <div className="comment__meta">
+              <span className="comment__author">…</span>
+            </div>
+          </div>
+        </div>
+      );
+    }
+    // Retries exhausted (or a legacy null hydrated from the persisted
+    // cache). Distinguishable from loading on purpose: an endless "…"
+    // card gave the reader nothing to do when HN's API had a bad night.
+    return (
+      <div className="comment comment--error">
+        <div className="comment__footer">
+          <div className="comment__meta">
+            <span className="comment__error-text">
+              Couldn't load this comment.
+            </span>
+          </div>
+          <button
+            type="button"
+            className="comment__retry"
+            data-testid="comment-retry"
+            onClick={() => refetch()}
+          >
+            Retry
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (item.deleted || item.dead || !item.text) {
+    return null;
+  }
+
+  const age = item.time ? formatTimeAgo(item.time) : '';
+  const kids = item.kids ?? [];
+  const hasReplies = kids.length > 0;
+  // On expand, warm this comment's children in one /api/items batch
+  // before rendering them, so the recursive <Comment> observers find
+  // cache hits instead of each firing their own Firebase fetch. Ids
+  // already cached (e.g. re-expand) skip the network entirely.
+  const toggle = () => {
+    if (isExpanded) {
+      setIsExpanded(false);
+      return;
+    }
+    if (kids.length === 0) {
+      setIsExpanded(true);
+      return;
+    }
+    const uncached = kids.filter(
+      (kid) => !queryClient.getQueryData(['comment', kid]),
+    );
+    if (uncached.length === 0) {
+      setIsExpanded(true);
+      return;
+    }
+    prefetchCommentBatch(queryClient, uncached, getItems).finally(() => {
+      setIsExpanded(true);
+    });
+  };
+
+  const metaParts: string[] = [];
+  if (age) metaParts.push(age);
+  if (hasReplies) {
+    metaParts.push(
+      `${kids.length} ${pluralize(kids.length, 'reply', 'replies')}`,
+    );
+  }
+  const metaTail = metaParts.join(' · ');
+
+  return (
+    <div
+      className={`comment${isExpanded ? ' is-expanded' : ''}`}
+      onClick={(e) => {
+        const target = e.target as HTMLElement;
+        if (target.closest('a, button')) return;
+        e.stopPropagation();
+        toggle();
+      }}
+    >
+      <div
+        className={`comment__body${isExpanded ? '' : ' comment__body--clamped'}`}
+        onClick={handleLinkClick}
+        dangerouslySetInnerHTML={{ __html: sanitizeCommentHtml(item.text) }}
+      />
+      <div className="comment__footer">
+        <div className="comment__meta">
+          {item.by ? (
+            <Link to={`/user/${item.by}`} className="comment__author">
+              {item.by}
+            </Link>
+          ) : null}
+          {metaTail ? (
+            <span className="comment__meta-suffix">
+              {item.by ? ` · ${metaTail}` : metaTail}
+            </span>
+          ) : null}
+        </div>
+        {isExpanded ? (
+          <div
+            className="comment__toolbar"
+            onClick={(e) => {
+              // Keeps a tap on the strip's dead space between buttons
+              // from reaching the row's toggle handler and collapsing
+              // the comment. Button/link taps already bail out via the
+              // row's closest('a, button') guard.
+              e.stopPropagation();
+            }}
+          >
+            <TooltipButton
+              type="button"
+              className={
+                'comment__toolbar-button' +
+                (voted ? ' comment__toolbar-button--active' : '')
+              }
+              tooltip={voted ? 'Unvote' : 'Upvote'}
+              aria-label={voted ? 'Unvote' : 'Upvote'}
+              aria-pressed={voted}
+              data-testid="comment-upvote"
+              onClick={() => toggleVote(id)}
+            >
+              <ToolbarUpArrowIcon />
+            </TooltipButton>
+            {/* Downvote — HN gates the `how=down` anchor behind ~500
+                karma and some per-item rules (own posts, etc). For
+                low-karma viewers the scrape step in /api/vote returns
+                502 and useVote surfaces a toast. We don't pre-check
+                that; it would cost an extra item-page fetch per
+                render for a minority case. */}
+            <TooltipButton
+              type="button"
+              className={
+                'comment__toolbar-button' +
+                (downvoted ? ' comment__toolbar-button--active' : '')
+              }
+              tooltip={downvoted ? 'Undownvote' : 'Downvote'}
+              aria-label={downvoted ? 'Undownvote' : 'Downvote'}
+              aria-pressed={downvoted}
+              data-testid="comment-downvote"
+              onClick={() => toggleDownvote(id)}
+            >
+              <ToolbarDownArrowIcon />
+            </TooltipButton>
+            <a
+              className="comment__toolbar-button"
+              href={`https://news.ycombinator.com/reply?id=${id}`}
+              target="_blank"
+              rel="noopener noreferrer"
+              aria-label="Reply on HN"
+              title="Reply on HN"
+              data-testid="comment-reply"
+            >
+              <ToolbarReplyIcon />
+            </a>
+          </div>
+        ) : null}
+        {/* Expand/collapse pinned to the bottom-right of the card.
+            Material Symbols `add`/`remove` so collapsed → "+" and
+            expanded → "−"; visible on every device so the control
+            is obvious regardless of whether the reader tries to
+            tap the card body or aim for the icon. */}
+        <button
+          type="button"
+          className="comment__toggle"
+          aria-expanded={isExpanded}
+          aria-label={isExpanded ? 'Collapse comment' : 'Expand comment'}
+          onClick={toggle}
+        >
+          <span
+            className="comment__toggle-icon"
+            data-expanded={isExpanded ? 'true' : 'false'}
+            aria-hidden="true"
+          >
+            <svg
+              viewBox="0 -960 960 960"
+              fill="currentColor"
+              width="18"
+              height="18"
+              focusable="false"
+            >
+              {isExpanded ? (
+                <path d="M200-440v-80h560v80H200Z" />
+              ) : (
+                <path d="M440-440H200v-80h240v-240h80v240h240v80H520v240h-80v-240Z" />
+              )}
+            </svg>
+          </span>
+        </button>
+      </div>
+      {hasReplies && isExpanded ? (
+        <ol className="comment__children">
+          {kids.map((kidId) => (
+            <li key={kidId}>
+              <Comment id={kidId} />
+            </li>
+          ))}
+        </ol>
+      ) : null}
+    </div>
+  );
+}

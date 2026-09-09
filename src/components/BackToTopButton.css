@@ -1,0 +1,7 @@
+/* The `.back-to-top-btn` layout (size, background, hover/active) lives in
+   StoryList.css alongside the sibling footer buttons, so the three share a
+   single source of truth that mirrors `.list-toolbar__button`. Only the
+   icon's display override lives here with the component. */
+.back-to-top-btn__icon {
+  display: block;
+}

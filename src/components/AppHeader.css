@@ -1,0 +1,159 @@
+.app-header {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background: var(--nh-bg);
+  color: var(--nh-text);
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 12px 4px 4px;
+  margin-bottom: 2px;
+  border-bottom: 1px solid var(--nh-border);
+}
+
+.app-header__menu-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: var(--tap-min);
+  min-height: var(--tap-min);
+  background: transparent;
+  border: none;
+  color: var(--nh-text);
+  font-size: 22px;
+  line-height: 1;
+  padding: 0 8px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.app-header__menu-icon {
+  font-size: 22px;
+  line-height: 1;
+}
+
+.app-header__home {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--nh-text);
+  text-decoration: none;
+  min-height: var(--tap-min);
+  padding: 4px 8px 4px 0;
+  border-radius: 4px;
+}
+
+.app-header__home:hover {
+  text-decoration: none;
+}
+
+/* Bottom-pill "n" mark — matches public/favicon.svg. Rounded-square
+   tile (the "phone body"), a white "n" biased toward the top so the
+   home-indicator pill has room below without the letter landing on
+   it, and a small white pill at the bottom edge. Pill is
+   proportionally thicker than the favicon's 512-viewBox version
+   (10×2 at 28 px vs. 160×12 at 512 px = ~9×0.7 pro-rata) so it
+   survives anti-aliasing. */
+.app-header__brand {
+  position: relative;
+  display: inline-block;
+  width: 28px;
+  height: 28px;
+  background: var(--nh-orange);
+  border-radius: 6px;
+  vertical-align: middle;
+}
+
+.app-header__brand::before {
+  content: "n";
+  position: absolute;
+  inset: 0 0 4px 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  font-weight: 700;
+  font-size: 17px;
+  line-height: 1;
+}
+
+.app-header__brand::after {
+  content: "";
+  position: absolute;
+  bottom: 3px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 10px;
+  height: 2px;
+  background: #fff;
+  border-radius: 1px;
+}
+
+.app-header__title {
+  font-weight: 700;
+  font-size: 17px;
+}
+
+.app-header__actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: auto;
+}
+
+.app-header__icon-btn {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: var(--tap-min);
+  min-height: var(--tap-min);
+  background: transparent;
+  border: none;
+  color: var(--nh-text);
+  padding: 0 6px;
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.app-header__icon-btn:disabled {
+  cursor: default;
+  color: color-mix(in srgb, var(--nh-text) 45%, transparent);
+}
+
+.app-header__offline {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-left: auto;
+  min-height: var(--tap-min);
+  min-width: var(--tap-min);
+  padding: 0 8px;
+  border: 1px solid var(--nh-border);
+  border-radius: 10px;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: 0.02em;
+  color: var(--nh-text);
+  background: transparent;
+  text-decoration: none;
+}
+
+@media (hover: hover) {
+  .app-header__offline:hover {
+    background: color-mix(in srgb, var(--nh-border) 35%, transparent);
+    text-decoration: none;
+  }
+}
+
+.app-header__offline:active {
+  background: color-mix(in srgb, var(--nh-border) 50%, transparent);
+}
+
+.app-header__actions .app-header__offline {
+  margin-left: 0;
+  margin-right: 4px;
+}

@@ -1,0 +1,170 @@
+.user-page {
+  background: var(--nh-bg-card);
+  padding: 16px;
+  border-bottom: 1px solid var(--nh-border);
+  color: var(--nh-text);
+}
+
+.user-page__id {
+  margin: 0 0 12px;
+  font-size: 22px;
+  font-weight: 700;
+}
+
+.user-page__stats {
+  display: flex;
+  gap: 24px;
+  margin: 0 0 12px;
+}
+
+.user-page__stats > div {
+  margin: 0;
+}
+
+.user-page__stats dt {
+  font-size: 12px;
+  color: var(--nh-meta);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.user-page__stats dd {
+  margin: 4px 0 0;
+  font-weight: 600;
+}
+
+.user-page__about {
+  font-size: 15px;
+  line-height: 1.5;
+  word-wrap: break-word;
+}
+
+.user-page__about a {
+  color: var(--nh-orange);
+  text-decoration: underline;
+}
+
+.user-page__recent {
+  margin-top: 20px;
+}
+
+.user-page__recent-heading {
+  margin: 0 0 8px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--nh-meta);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.user-page__recent-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+/* Wrapper around per-story groups. Each <li> is one group = one
+   article's title heading plus its comment cards. The outer list has
+   no visible styling; the inner .user-page__recent-list carries the
+   comment-card chrome. */
+.user-page__recent-groups {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.user-page__recent-group + .user-page__recent-group {
+  margin-top: 16px;
+}
+
+/* Story-title heading above each group's comment cards. Reads as a
+   section heading — heavier than the meta-style "Recent comments"
+   eyebrow above the list, lighter than the user's own h1 at the top
+   of the page. Linked to /item/<storyId>. */
+.user-page__recent-group-title {
+  margin: 0 0 6px;
+  padding: 0 var(--comment-gutter);
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.3;
+  color: var(--nh-text);
+  word-wrap: break-word;
+}
+
+.user-page__recent-group-title a {
+  color: inherit;
+  text-decoration: none;
+}
+
+@media (hover: hover) {
+  .user-page__recent-group-title a:hover {
+    text-decoration: underline;
+  }
+}
+
+/* Mirror Comment.css visuals (left stripe, gutter padding, body type
+   scale, meta line) so a comment on this page reads as the same kind
+   of object it does on the thread. The whole row is a Link to /item/:id
+   so every snippet is one tap target. */
+.user-page__recent-item {
+  display: block;
+  padding: 8px var(--comment-gutter) var(--comment-stack-gap);
+  border-top: 1px solid var(--nh-border);
+  background: var(--nh-bg-card);
+  color: var(--nh-text);
+  text-decoration: none;
+  box-shadow: inset 3px 0 0 0 var(--nh-border);
+}
+
+.user-page__recent-list > li:last-child .user-page__recent-item {
+  border-bottom: 1px solid var(--nh-border);
+}
+
+@media (hover: hover) {
+  .user-page__recent-item:hover {
+    background: var(--nh-pressed);
+    text-decoration: none;
+  }
+}
+
+.user-page__recent-item:active {
+  background: var(--nh-border);
+}
+
+.user-page__recent-body {
+  font-size: 15px;
+  line-height: 1.5;
+  color: var(--nh-text);
+  word-wrap: break-word;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.user-page__recent-meta {
+  margin-top: 4px;
+  padding-left: 1px;
+  font-size: 13px;
+  color: var(--nh-meta);
+}
+
+.user-page__recent-status {
+  margin: 8px 0 0;
+  font-size: 14px;
+  color: var(--nh-meta);
+}
+
+.user-page__recent-more {
+  margin-top: 12px;
+  font-size: 14px;
+}
+
+.user-page__recent-more a {
+  color: var(--nh-orange);
+}
+
+.user-page__back {
+  margin-top: 16px;
+  font-size: 14px;
+}

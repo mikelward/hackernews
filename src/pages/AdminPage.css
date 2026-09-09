@@ -1,0 +1,248 @@
+.admin-page {
+  background: var(--nh-bg-card);
+  padding: 16px;
+  border-bottom: 1px solid var(--nh-border);
+  color: var(--nh-text);
+  font-size: 15px;
+  line-height: 1.5;
+}
+
+.admin-page__title {
+  margin: 0 0 8px;
+  font-size: 22px;
+  font-weight: 700;
+}
+
+.admin-page__intro {
+  margin: 0 0 16px;
+  color: var(--nh-meta);
+  font-size: 13px;
+}
+
+.admin-page__heading {
+  margin: 20px 0 8px;
+  font-size: 16px;
+  font-weight: 700;
+}
+
+.admin-page__list {
+  margin: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.admin-page__list > div {
+  display: flex;
+  gap: 12px;
+  align-items: baseline;
+}
+
+.admin-page__list dt {
+  color: var(--nh-meta);
+  min-width: 92px;
+}
+
+.admin-page__list dd {
+  margin: 0;
+}
+
+.admin-page__service-row {
+  display: grid;
+  grid-template-columns: 14px auto 1fr;
+  gap: 10px;
+  align-items: center;
+  margin: 0 0 8px;
+}
+
+.admin-page__badge {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.admin-page__badge[data-state='ok'] {
+  background: #2f8a3c;
+}
+
+.admin-page__badge[data-state='warn'] {
+  background: #c77700;
+}
+
+.admin-page__badge[data-state='off'] {
+  background: var(--nh-meta);
+  opacity: 0.5;
+}
+
+.admin-page__service-name {
+  font-weight: 600;
+}
+
+.admin-page__service-detail {
+  color: var(--nh-meta);
+  font-size: 13px;
+}
+
+.admin-page__note {
+  margin: 4px 0 12px;
+  color: var(--nh-meta);
+  font-size: 13px;
+}
+
+.admin-page__details {
+  margin: 8px 0 12px;
+}
+
+.admin-page__details summary {
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--nh-meta);
+  min-height: 36px;
+  display: flex;
+  align-items: center;
+}
+
+.admin-page__raw {
+  background: var(--nh-bg-code);
+  padding: 8px 10px;
+  border-radius: 4px;
+  font-size: 12px;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.admin-page__actions {
+  margin: 20px 0 0;
+}
+
+.admin-page__refresh {
+  background: var(--nh-bg-card);
+  color: var(--nh-text);
+  border: 1px solid var(--nh-border);
+  padding: 6px 12px;
+  border-radius: 4px;
+  font-size: 13px;
+  cursor: pointer;
+  min-height: 36px;
+}
+
+@media (hover: hover) {
+  .admin-page__refresh:hover {
+    background: var(--nh-bg);
+  }
+}
+
+.admin-page__refresh:active {
+  background: var(--nh-border);
+}
+
+.admin-page__refresh:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.admin-page code {
+  background: var(--nh-bg-code);
+  padding: 1px 4px;
+  border-radius: 3px;
+  font-size: 13px;
+}
+
+/* `:where()` lowers the selector specificity to 0,0,1 so this rule
+   styles plain prose links inside the admin shell (intro, notes,
+   back link) without overriding higher-specificity link styles
+   inside embedded components — notably `.story-row__body` on the
+   /tuning Preview, which intentionally renders as black title +
+   gray meta with no underline. */
+:where(.admin-page) a {
+  color: var(--nh-orange);
+  text-decoration: underline;
+}
+
+.admin-page__back {
+  margin-top: 20px;
+  font-size: 14px;
+}
+
+.admin-page__stats-grid {
+  display: grid;
+  gap: 12px;
+}
+
+.admin-page__stats-card {
+  border: 1px solid var(--nh-border);
+  border-radius: 6px;
+  padding: 12px 14px;
+  background: var(--nh-bg);
+}
+
+.admin-page__stats-title {
+  margin: 0 0 2px;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.admin-page__stats-window {
+  margin: 0 0 8px;
+  color: var(--nh-meta);
+  font-size: 12px;
+}
+
+.admin-page__stats-headline {
+  margin: 4px 0 6px;
+  font-size: 22px;
+  font-weight: 700;
+}
+
+.admin-page__stats-list {
+  margin: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.admin-page__stats-list > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: baseline;
+}
+
+.admin-page__stats-list dt {
+  color: var(--nh-meta);
+  font-size: 13px;
+}
+
+.admin-page__stats-list dd {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.admin-page__stats-empty,
+.admin-page__stats-error {
+  margin: 0;
+  color: var(--nh-meta);
+  font-size: 13px;
+}
+
+.admin-page__stats-list--cost {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--nh-border);
+}
+
+.admin-page__stats-note {
+  margin: 8px 0 0;
+  color: var(--nh-meta);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.admin-page__stats-not-configured {
+  margin: 0 0 12px;
+  padding: 12px 14px;
+  border: 1px dashed var(--nh-border);
+  border-radius: 6px;
+  color: var(--nh-meta);
+  font-size: 13px;
+}

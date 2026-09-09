@@ -1,0 +1,84 @@
+/*
+ * chromePreview.css
+ *
+ * Optional app-bar color schemes surfaced through the drawer's Theme
+ * picker. The shipping default — `mono` — is painted entirely by the
+ * baseline CSS in `AppHeader.css` / `HeaderAccountMenu.css`, so this
+ * file only contains the overrides for the two *alternate* picks:
+ *
+ *   - `duo`: same as `mono` but with the wordmark painted in brand
+ *     orange. Single-property delta.
+ *   - `classic`: restores the pre-mono orange header — solid
+ *     `--nh-orange` bar, white wordmark, outlined disc mark. A larger
+ *     block of overrides that replays the old chrome on top of the
+ *     neutral baseline.
+ *
+ * Selectors are explicitly scoped to the known attribute values so a
+ * corrupt or unknown stored `data-chrome` won't half-apply anything —
+ * the boot script and `setStoredChrome` already whitelist on the
+ * JS side, this is belt-and-suspenders for CSS.
+ */
+
+/* ---------- Duo ----------
+ * `mono` baseline paints `.app-header__home` with `var(--nh-text)`;
+ * Duo overrides just that single color so the wordmark picks up the
+ * brand accent without touching the disc, the bar, or the icons. */
+
+:root[data-chrome='duo'] .app-header__home {
+  color: var(--nh-orange);
+}
+
+/* ---------- Classic ----------
+ * The legacy all-orange sticky header. Reinstates the bar bg, white
+ * wordmark + icons, outlined disc mark, white focus rings (needed
+ * because the global orange ring is invisible against an orange bar),
+ * and the offline-pill / disabled-button styles that assumed white
+ * text on an orange surface. */
+
+:root[data-chrome='classic'] .app-header {
+  background: var(--nh-orange);
+  color: #fff;
+  border-bottom: none;
+  box-shadow: 0 1px 0 rgba(0, 0, 0, 0.08);
+}
+
+:root[data-chrome='classic'] .app-header__menu-btn,
+:root[data-chrome='classic'] .app-header__home,
+:root[data-chrome='classic'] .app-header__icon-btn,
+:root[data-chrome='classic'] .header-account__btn {
+  color: #fff;
+}
+
+:root[data-chrome='classic'] .app-header__brand {
+  background: transparent;
+  color: #fff;
+  border: 1px solid #fff;
+}
+
+:root[data-chrome='classic'] .app-header__menu-btn:focus-visible,
+:root[data-chrome='classic'] .app-header__home:focus-visible,
+:root[data-chrome='classic'] .app-header__icon-btn:focus-visible,
+:root[data-chrome='classic'] .header-account__btn:focus-visible {
+  outline-color: #fff;
+}
+
+:root[data-chrome='classic'] .app-header__icon-btn:disabled {
+  color: rgba(255, 255, 255, 0.45);
+}
+
+:root[data-chrome='classic'] .app-header__offline {
+  color: #fff;
+  background: rgba(0, 0, 0, 0.1);
+  border-color: rgba(255, 255, 255, 0.7);
+}
+
+/* Sticky :hover guard — only apply on devices with a true pointer. */
+@media (hover: hover) {
+  :root[data-chrome='classic'] .header-account__btn:hover {
+    background: rgba(0, 0, 0, 0.1);
+  }
+}
+
+:root[data-chrome='classic'] .header-account__btn:active {
+  background: rgba(0, 0, 0, 0.18);
+}

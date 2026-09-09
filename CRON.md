@@ -1,0 +1,574 @@
+# Cron operator playbook
+
+This is the runbook for `/api/warm-summaries` — the Vercel cron that
+keeps the article + comments summary cache warm for the top 30 HN
+stories, and emits the change-analytics log stream used to tune the
+backoff knobs.
+
+For **why** the cron exists and how it's structured, see `SPEC.md` §
+"Scheduled warming and change analytics". This doc is narrowly about
+**how to run it in production**: enabling, verifying, tuning,
+troubleshooting, and shutting down.
+
+## What the cron does in one paragraph
+
+Every 5 minutes (per `vercel.json`), Vercel hits
+`/api/warm-summaries?feed=top&n=30`. The handler fetches HN
+`topstories`, takes the first 30 ids with `score > 1` and not
+dead/deleted, and for each runs two tracks in parallel: an **article
+track** (Jina Reader → SHA-256 hash → compare to stored `articleHash`
+→ regenerate via Gemini only on change) and a **comments track** (top
+20 top-level kids → build transcript → SHA-256 hash → compare to
+stored `transcriptHash` → regenerate insights only on change). Both
+tracks write a structured JSON log line per story; a per-run summary
+logs counts. Records live 30 days in Upstash and are owned by the
+cron; user-facing `/api/summary` and `/api/comments-summary` trust
+whatever is in the cache.
+
+## Prerequisites
+
+1. **Vercel Pro tier.** Sub-daily cron schedules (our `*/5 * * * *`)
+   require Pro. Hobby allows only daily schedules.
+2. **Upstash Redis / Vercel Storage Marketplace Redis** provisioned
+   and linked to the project.
+3. **Gemini API key** (Google AI Studio).
+4. **Jina Reader API key.** This is a **hard dependency for link
+   posts** — the raw-HTML fallback was removed (see TODO.md §
+   "Article-fetch fallback"). Without a Jina key, the article track
+   logs `skipped_unreachable` on every story *that has a URL* and
+   `/api/summary` returns 503 `not_configured` for it — **on a cache
+   miss**. The endpoint reads the stored record before it looks at
+   any provider key, so a link post that is already warm keeps
+   serving through a Jina outage until its record expires; only
+   stories the warm never reached show the error.  **Self-posts
+   are unaffected either way**: both paths gate the Jina call behind
+   `hasArticleUrl` and summarize Ask HN / Show HN / text-only stories
+   from the HN `text` directly, and the comments track never touches
+   Jina at all. So a Jina outage degrades link-post article summaries
+   only — worth knowing before reading a quiet `/new` as "summaries
+   are down".
+
+## Required environment variables
+
+Set these in **Vercel → Project → Settings → Environment Variables**,
+scoped to **Production** (and **Preview** if you want PR previews to
+also warm the cache). Redeploy after any change.
+
+| Name | What it's for |
+|---|---|
+| `CRON_SECRET` | Shared secret Vercel Cron sends in the `Authorization: Bearer <secret>` header when firing the job. **You have to set this yourself** — Vercel does not auto-generate it. Without it set (and scoped to the environment the cron is firing in), every scheduled invocation will hit the handler with no `Authorization` header and our fail-closed check returns 403 silently. Any long random string works; `openssl rand -hex 32` is fine. |
+| `GOOGLE_API_KEY` | Gemini 2.5 Flash-Lite. Used by both user-facing summary endpoints and the cron. |
+| `JINA_API_KEY` | Jina Reader. Required — no fallback. |
+| `KV_REST_API_URL` + `KV_REST_API_TOKEN` *or* `UPSTASH_REDIS_REST_URL` + `UPSTASH_REDIS_REST_TOKEN` | Upstash credentials. Either pair works. Vercel Storage Marketplace auto-injects the `KV_REST_*` pair; a direct Upstash project uses `UPSTASH_REDIS_REST_*`. |
+
+## Optional knobs (all env-tunable)
+
+All defaults match `SPEC.md` § "Tiered backoff". Leave them alone
+until you have a week of real `warm-story` logs to base a tweak on.
+
+| Name | Default | Applies to | Effect |
+|---|---|---|---|
+| `WARM_REFRESH_CHECK_INTERVAL_SECONDS` | `1800` (30 min) | Article (+ comments fallback when `story.time` missing) | Article re-check cadence while content is "fresh". |
+| `WARM_STABLE_CHECK_INTERVAL_SECONDS` | `7200` (2 h) | Both tracks | Re-check cadence once content has been unchanged ≥ `WARM_STABLE_THRESHOLD_SECONDS`. |
+| `WARM_STABLE_THRESHOLD_SECONDS` | `21600` (6 h) | Both tracks | How long unchanged before switching to the stable interval. |
+| `WARM_MAX_STORY_AGE_SECONDS` | `115200` (32 h) | Article only | Stop re-checking past this story age. Upstash record still serves reads until 30-day TTL. |
+| `WARM_COMMENTS_MAX_AGE_SECONDS` | `115200` (32 h) | Comments only | Twin of the article cutoff. Past this we stop hashing transcripts; cached insights still serve until Upstash evicts at 30 days. |
+| `WARM_TOP_N` | `30` | Both tracks | How many feed ids to process per tick when `?n=` isn't in the URL. **The scheduled cron always passes `?n=30`, so this never applies to it** — it's the fallback for a manual request. Change the tick size in `vercel.json`. |
+| `WARM_COMMENTS_MIN_KIDS` | `5` | Comments only | Minimum usable top-level comments before the cron creates a `first_seen` record. Avoids caching 2-comment thin threads. |
+
+Comments also use a **compile-time ladder** (`COMMENTS_TIERS` in `api/warm-summaries.ts`) keyed off HN `story.time`: 15/30/60/120/240/480 min intervals for 0-1/1-2/2-4/4-8/8-16/16-32 h age bands. Bucket widths are 1:1 with the `ageBand` log field, so "polled per band" and "changed per band" plot against the same x-axis. To reshape the ladder, edit the constant and redeploy — it's deliberately not an env var.
+
+## Enabling the cron
+
+The cron is declared in `vercel.json`:
+
+```json
+{
+  "crons": [
+    { "path": "/api/warm-summaries?feed=top&n=30", "schedule": "*/5 * * * *" }
+  ]
+}
+```
+
+There is no dashboard toggle — on deploy, Vercel reads the `crons`
+field and registers the schedule. The Settings → Cron Jobs page is a
+read-only listing.
+
+Steps for a fresh project:
+
+1. **Set `CRON_SECRET`** in **Vercel → Project → Settings →
+   Environment Variables**. Any long random string works; a common
+   choice is `openssl rand -hex 32`. Scope it to **Production** (and
+   **Preview** too if you want preview deploys to also warm the
+   cache). Save the value locally — Vercel's UI won't let you read
+   it back later.
+2. **Set the other required env vars** from the table above
+   (`GOOGLE_API_KEY`, `JINA_API_KEY`, Upstash credentials).
+3. **Deploy to production** — env var changes don't apply to
+   existing deployments, and the `crons` entry is only registered
+   by a fresh build.
+4. **Verify** in **Vercel → Project → Settings → Cron Jobs**: you
+   should see `/api/warm-summaries?feed=top&n=30` with its next run
+   time. First scheduled invocation lands within 5 minutes.
+
+If `CRON_SECRET` is left unset at step 1, Vercel Cron still fires
+but without an `Authorization` header, and our fail-closed check
+returns 403 on every tick. The symptom is "the cron runs but
+nothing gets warmed" — see Troubleshooting below.
+
+## Verifying it works
+
+### Manual trigger
+
+```bash
+# Use the same CRON_SECRET value you set in Vercel. Vercel's UI
+# doesn't let you read it back, so this is the value you saved
+# locally at enablement time.
+curl -i -X GET \
+  -H "Authorization: Bearer $CRON_SECRET" \
+  "https://newshacker.app/api/warm-summaries?feed=top&n=3"
+```
+
+Expected response (truncated):
+
+```
+HTTP/1.1 200 OK
+content-type: application/json; charset=utf-8
+cache-control: private, no-store
+
+{"ok":true,"feed":"top","storyCount":3,"processed":6,"outcomes":{
+  "article":{...},"comments":{...}}}
+```
+
+`n=3` keeps the manual test cheap. `?n=30` runs the full tick.
+
+### Scheduled run
+
+Wait ≤5 min after deploy, then look at **Vercel → Logs → Functions**
+and filter to `/api/warm-summaries`. Each run writes:
+
+- **One `warm-run` line** at the end: the per-tick summary.
+- **Two `warm-story` lines per story processed**: one for each track.
+
+Minimum-viable health check: does a `warm-run` line land every 5 min,
+and is its `processed` > 0? If yes, the cron is alive.
+
+### Useful `jq` queries
+
+For quick spot-checks against the last 24 h of Vercel function logs
+before they age out. Copy the logs down (CLI: `vercel logs production
+--since 24h | grep warm-story > warm.jsonl`) and poke around:
+
+```bash
+# Outcome histogram per track
+jq -r 'select(.type=="warm-story") | [.track, .outcome] | @tsv' warm.jsonl \
+  | sort | uniq -c | sort -rn
+
+# Change rate by content age (articles)
+jq -r 'select(.type=="warm-story" and .track=="article" and (.outcome=="unchanged" or .outcome=="changed"))
+       | [(.ageMinutes//0 | tonumber / 60 | floor), .outcome] | @tsv' warm.jsonl \
+  | sort | uniq -c
+
+# Per-run duration and throughput
+jq -r 'select(.type=="warm-run") | [.durationMs, .processed, .storyCount] | @tsv' warm.jsonl
+```
+
+### Useful APL queries (Axiom)
+
+For longer-window analysis (up to the Axiom retention tier) once the
+**Axiom Vercel integration** is wired up. See
+[axiom.co/docs/apps/vercel](https://axiom.co/docs/apps/vercel) for
+install steps. Three setup gotchas worth spelling out (all three are
+baked into the templates below, but call them out here so the
+queries make sense):
+
+- **APL nested-field syntax.** The ingested schema has dotted field
+  names like `vercel.source` and `vercel.projectName`. Because the
+  dataset itself is also called `vercel`, bare `vercel.source`
+  confuses the parser; use the bracket-and-quote form:
+  `['vercel.source']`. This one comes first because the next two
+  gotchas both reference fields that need this treatment.
+- **The integration ships logs from *every* Vercel project it has
+  access to by default.** If you've added it at the team level or
+  have other projects, every query must filter
+  `['vercel.projectName'] == "newshacker"` or you'll be reading
+  someone else's logs. The templates below all include the filter.
+- **Vercel emits three distinct log sources.** Build logs
+  (`['vercel.source'] == "build"`), static/edge cache logs
+  (`"static"`), and function runtime logs (`"lambda"`). Cron output
+  lives only in `"lambda"` logs. The filter below gates on that.
+
+Paste any of these into the Axiom query console:
+
+```apl
+// Outcome histogram per track, last 24 h. The equivalent of the first
+// jq query above.
+['vercel']
+| where _time > ago(24h)
+| where ['vercel.projectName'] == "newshacker"
+| where ['vercel.source'] == "lambda"
+| where message contains "warm-story"
+| extend e = parse_json(message)
+| summarize count() by track=tostring(e.track), outcome=tostring(e.outcome)
+| sort by track asc, count_ desc
+```
+
+```apl
+// Change rate by article age bucket (hours). Tells you whether
+// articles past N hours settle down — if the changed/total ratio
+// plummets past 4-6 h, WARM_STABLE_CHECK_INTERVAL_SECONDS can push
+// out further.
+['vercel']
+| where _time > ago(7d)
+| where ['vercel.projectName'] == "newshacker"
+| where ['vercel.source'] == "lambda"
+| where message contains "warm-story"
+| extend e = parse_json(message)
+| where tostring(e.track) == "article"
+| where tostring(e.outcome) in ("changed", "unchanged")
+| extend ageHours = bin(todouble(e.ageMinutes) / 60, 1)
+| summarize
+    changed = countif(tostring(e.outcome) == "changed"),
+    unchanged = countif(tostring(e.outcome) == "unchanged"),
+    total = count()
+  by ageHours
+| extend changeRate = round(todouble(changed) / todouble(total), 3)
+| sort by ageHours asc
+```
+
+```apl
+// Inspect article-"changed" rows to check for Jina rendering noise.
+// Two successive rows for the same storyId with contentBytes delta
+// under ~100 almost certainly indicate a dynamic element in the
+// article body (timestamp, ad slot, related-items widget) flipping
+// the hash without a real edit. Real edits are usually multi-KB.
+['vercel']
+| where _time > ago(24h)
+| where ['vercel.projectName'] == "newshacker"
+| where ['vercel.source'] == "lambda"
+| where message contains "warm-story"
+| extend e = parse_json(message)
+| where tostring(e.track) == "article" and tostring(e.outcome) == "changed"
+| project
+    _time,
+    storyId = toint(e.storyId),
+    ageMinutes = todouble(e.ageMinutes),
+    stableForMinutes = todouble(e.stableForMinutes),
+    contentBytes = toint(e.contentBytes)
+| sort by storyId asc, _time asc
+```
+
+```apl
+// Per-run summary: how long is each tick taking and how much did it
+// do? durationMs approaching 50 000 means we're hitting the
+// WALL_CLOCK_BUDGET_MS guard; expect trailing stories to log
+// skipped_budget.
+['vercel']
+| where _time > ago(24h)
+| where ['vercel.projectName'] == "newshacker"
+| where ['vercel.source'] == "lambda"
+| where message contains "warm-run"
+| extend e = parse_json(message)
+| project
+    _time,
+    durationMs = toint(e.durationMs),
+    storyCount = toint(e.storyCount),
+    processed = toint(e.processed)
+| sort by _time desc
+```
+
+```apl
+// Change rate per age band. Works on both tracks — swap
+// e.track to "article" to look at the article side. This is
+// the query the tiered schedule was instrumented for: where
+// does `changed` fall off enough to justify either a longer
+// interval or a hard stop at that band?
+['vercel']
+| where _time > ago(7d)
+| where ['vercel.projectName'] == "newshacker"
+| where ['vercel.source'] == "lambda"
+| where message contains "warm-story"
+| extend e = parse_json(message)
+| where tostring(e.track) == "comments"
+| where tostring(e.outcome) in ("changed", "unchanged")
+| summarize
+    changed = countif(tostring(e.outcome) == "changed"),
+    unchanged = countif(tostring(e.outcome) == "unchanged"),
+    total = count()
+  by ageBand = tostring(e.ageBand)
+| extend changeRate = round(todouble(changed) / todouble(total), 3)
+// Lexicographic sort on ageBand would put "16-32h" before "2-4h".
+// Explicit ordering keeps the histogram in true chronological order.
+| extend ageBandOrder = case(
+    ageBand == "0-1h", 0,
+    ageBand == "1-2h", 1,
+    ageBand == "2-4h", 2,
+    ageBand == "4-8h", 3,
+    ageBand == "8-16h", 4,
+    ageBand == "16-32h", 5,
+    ageBand == "32h+", 6,
+    999)
+| order by ageBandOrder asc
+```
+
+```apl
+// Jitter per publisher: how often does example.com's article hash
+// flip on a tick, and when it does, is it a real edit (multi-KB
+// delta) or in-body timestamp / cache-buster noise (tiny delta)?
+// Drives the "can we stop re-fetching this host after the first
+// successful summary?" call — publishers with changeRate > ~0.3
+// AND median(deltaBytes) < ~200 are probably jittering, not
+// editing. Articles track only.
+['vercel']
+| where _time > ago(24h)
+| where ['vercel.projectName'] == "newshacker"
+| where ['vercel.source'] == "lambda"
+| where message contains "warm-story"
+| extend e = parse_json(message)
+| where tostring(e.track) == "article"
+| where tostring(e.outcome) in ("changed", "unchanged")
+| summarize
+    changed = countif(tostring(e.outcome) == "changed"),
+    unchanged = countif(tostring(e.outcome) == "unchanged"),
+    total = count(),
+    medianDelta = percentile(toint(e.deltaBytes), 50),
+    p90Delta = percentile(toint(e.deltaBytes), 90)
+  by urlHost = tostring(e.urlHost)
+| extend changeRate = round(todouble(changed) / todouble(total), 3)
+| where total >= 5  // drop singletons
+| order by changeRate desc
+```
+
+```apl
+// Paywall prevalence per publisher. `paywalled` is the
+// detectPaywall() verdict on the Jina-clean body — true when Jina's
+// response looked like a paywall teaser / overlay, false when it
+// looked like real article content. Filter to outcomes that actually
+// ran the detector (first_seen / unchanged / changed) and group by
+// host to see which publishers Jina is routinely getting a wall from
+// vs the ones it's getting real content from. Combine with the
+// jitter query above to disambiguate "stable paywall" from "stable
+// evergreen article": a host with `paywalledShare > 0.8` AND
+// `changeRate < 0.05` is a confirmed wall-and-nothing-moving; a host
+// with `paywalledShare ~ 0` AND `changeRate < 0.05` is just a static
+// publisher.
+['vercel']
+| where _time > ago(7d)
+| where ['vercel.projectName'] == "newshacker"
+| where ['vercel.source'] == "lambda"
+| where message contains "warm-story"
+| extend e = parse_json(message)
+| where tostring(e.track) == "article"
+| where tostring(e.outcome) in ("first_seen", "unchanged", "changed")
+| where isnotnull(e.paywalled)
+| summarize
+    paywalled = countif(tobool(e.paywalled) == true),
+    total = count()
+  by urlHost = tostring(e.urlHost)
+| extend paywalledShare = round(todouble(paywalled) / todouble(total), 3)
+| where total >= 5  // drop singletons
+| order by paywalledShare desc, total desc
+```
+
+```apl
+// Noise vs real-edit split across all article `changed` events.
+// Two rough histograms over `deltaBytes` — under ~200 B is almost
+// always noise (timestamp flip, reaction count), over ~1 KB is
+// almost always a real edit. The boundary between is where the
+// interesting calls live.
+['vercel']
+| where _time > ago(24h)
+| where ['vercel.projectName'] == "newshacker"
+| where ['vercel.source'] == "lambda"
+| where message contains "warm-story"
+| extend e = parse_json(message)
+| where tostring(e.track) == "article"
+| where tostring(e.outcome) == "changed"
+| extend bucket = case(
+    toint(e.deltaBytes) < 100, "noise (<100B)",
+    toint(e.deltaBytes) < 1000, "ambiguous (100-1000B)",
+    "real edit (>=1KB)")
+| summarize count() by bucket
+```
+
+```apl
+// Hypothesis-testing instrumentation (article track only, added
+// per reports/2026-04-29-cache-strategy.md). For each `changed`
+// event in the suspected-noise tier (`deltaBytes < 256`), would
+// title-change, lede-change, or a correction-keyword delta have
+// flagged the row as "actually significant"? If most noise-tier
+// events have all three flags absent, a future skip rule can
+// treat them as no-ops with high confidence; if any one of them
+// fires often, that's the signal worth wiring into the gate.
+['vercel']
+| where _time > ago(7d)
+| where ['vercel.projectName'] == "newshacker"
+| where ['vercel.source'] == "lambda"
+| where message contains "warm-story"
+| extend e = parse_json(message)
+| where tostring(e.track) == "article"
+| where tostring(e.outcome) == "changed"
+// Exclude legacy `changed` rows whose prior record predated
+// `contentBytes` persistence — those have no `deltaBytes`, and
+// `toint(null)` evaluates to 0, which would mis-classify them
+// as the suspected-noise tier.
+| where isnotnull(e.deltaBytes)
+| where toint(e.deltaBytes) < 256
+| extend
+    titleChanged = tobool(e.titleChanged) == true,
+    ledeChanged = tobool(e.ledeChanged) == true,
+    hasCorrectionDelta = isnotnull(e.correctionKeywordDelta)
+| summarize
+    total = count(),
+    titleOnly = countif(titleChanged and not(ledeChanged) and not(hasCorrectionDelta)),
+    ledeOnly = countif(not(titleChanged) and ledeChanged and not(hasCorrectionDelta)),
+    correctionOnly = countif(not(titleChanged) and not(ledeChanged) and hasCorrectionDelta),
+    anySignal = countif(titleChanged or ledeChanged or hasCorrectionDelta),
+    noSignal = countif(not(titleChanged) and not(ledeChanged) and not(hasCorrectionDelta))
+| extend
+    anySignalShare = round(todouble(anySignal) / todouble(total), 3),
+    noSignalShare = round(todouble(noSignal) / todouble(total), 3)
+```
+
+```apl
+// Cron-only Gemini spend, last 24 h. The cron logs Gemini token
+// counts on `warm-story` lines for `first_seen` and `changed`
+// outcomes (both tracks) — `geminiPromptTokens`,
+// `geminiOutputTokens`, `geminiTotalTokens`. Same field names as on
+// the user-path `summary-outcome` / `comments-summary-outcome`
+// lines, so a single APL query unioning all three line types
+// answers "total Gemini spend" cross-path; this query is the
+// cron-only slice of that.
+['vercel']
+| where _time > ago(24h)
+| where ['vercel.projectName'] == "newshacker"
+| where ['vercel.source'] == "lambda"
+| where message contains "warm-story"
+| extend e = parse_json(message)
+| where tostring(e.outcome) in ("first_seen", "changed")
+| summarize
+    promptTokens = sum(toint(e.geminiPromptTokens)),
+    outputTokens = sum(toint(e.geminiOutputTokens))
+  by track = tostring(e.track)
+| order by track asc
+```
+
+Save any of these as **Starred queries** in Axiom (star icon on a
+run) so you can re-run them with one click instead of re-pasting.
+The in-app dashboard at `/admin` (see `SPEC.md` § *Operator
+analytics dashboard*) already wraps the cache-hit / token-spend /
+top-failures / rate-limit / warm-cron-last-run queries into a
+five-card view; the per-host paywall and churn queries above remain
+console-only for now.
+
+## Tomorrow-morning evaluation checklist
+
+After the cron has been running overnight on the PR-#177 instrumentation, work through these in order. Each is one-click via a Starred Axiom query, using the templates above.
+
+1. **Smoke check — is the cron healthy?** "Per-run summary" query. Expect one `warm-run` log every 5 minutes, `durationMs` well under 50 000, `processed ≈ 60` (30 stories × 2 tracks).
+2. **Change rate per age band — comments.** "Change rate per age band" query with `e.track == "comments"`. Expect changeRate to monotonically decrease from `0-1h` down. If `8-16h` or `16-32h` bands still show non-trivial changeRate, the 240-min / 480-min tier intervals are right-sized; if they're ~0, that's evidence the 32h cutoff could move earlier (tighten `WARM_COMMENTS_MAX_AGE_SECONDS`).
+3. **Change rate per age band — articles.** Same query with `e.track == "article"`. Tells us whether the 32h article cutoff is well placed, and whether articles past ~8 h still change often enough to justify polling them at all.
+4. **Jitter per publisher.** "Jitter per publisher" query. Publishers with `changeRate > 0.3` and `medianDelta < 200` are strong candidates for a "fetch once then stop" policy — a future PR. Publishers with `changeRate > 0.3` and `medianDelta > 1000` are genuinely edited frequently (wire-service news sites) and the current polling is earning its keep.
+5. **Noise vs real-edit split.** The `deltaBytes` histogram query. If "noise (<100B)" dominates article `changed` events by >50%, we're paying Gemini to regenerate summaries for what are effectively unchanged articles — strongest lever for a cost cut.
+
+That's the evaluation in about 5–10 minutes of Axiom clicks. The `warm-story` logs are already in Axiom ingestion, same stream as every other `/api/*` log.
+
+## Tuning the knobs
+
+After a week of `warm-story` logs, look for:
+
+- **Article track — "changed" rate per age bucket.** If articles
+  almost never change past 4–6 h (`stableFor` is long and
+  `summaryChanged` stays false), push `WARM_STABLE_CHECK_INTERVAL_SECONDS`
+  up from 2 h → 4 h. If the stable threshold catches things too
+  slowly (you see recent `changed` with `stableFor < 6 h`), lower
+  `WARM_STABLE_THRESHOLD_SECONDS`.
+- **Comments track — tier ladder.** Run the "Change rate per age
+  band" query above against `e.track == "comments"`. If the
+  `0-1h` band's changed rate is low, the 15-min tier-1 cadence is
+  over-eager; edit `COMMENTS_TIERS[0]` to something longer and
+  redeploy. If `16-32h` shows meaningful changes, the 480-min
+  interval may be too lazy — tighten it, or extend the stop-age
+  beyond 32 h via `WARM_COMMENTS_MAX_AGE_SECONDS`.
+- **Max story age.** If the count of `skipped_age` outcomes is
+  high and the `changed` count in the `16-32h` band is trivial,
+  drop `WARM_MAX_STORY_AGE_SECONDS` / `WARM_COMMENTS_MAX_AGE_SECONDS`
+  to 24 h to save cycles.
+- **Min-kids gate.** If `skipped_low_volume` dominates young-story
+  logs but most of those threads later grew past 5 and we missed
+  the first-bucket data, drop `WARM_COMMENTS_MIN_KIDS` to 3. If
+  we keep regenerating 5-comment threads that immediately look
+  different 20 min later, raise it to 8.
+
+## Disabling / emergency kill switch
+
+In priority order:
+
+1. **Remove the `crons` entry from `vercel.json` and redeploy.** The
+   cleanest stop. Vercel stops scheduling it. User-facing summaries
+   still work, but understand what "no cron-maintained freshness"
+   means for the two cases: a story with **no** record still gets a
+   cold generation on thread open (the reader waits, nothing is
+   lost), while a story that **has** one goes silently stale —
+   `handleSummaryRequest` returns any record it finds with no hash
+   or age test, so nothing on the read path re-checks the source and
+   the summary stands until the record expires at 30 days. That
+   second case has no error state and no symptom a reader could
+   report, so a long disable needs a plan for it.
+2. **Change `n=30` to `n=1` in `vercel.json`'s cron path and
+   redeploy.** Shrinks the cron to a single story per tick — ~97%
+   cost reduction, for a cooling-off period while you diagnose.
+   **Setting `WARM_TOP_N=1` in the environment will *not* do this**:
+   the cron URL passes `n` explicitly and
+   `parseWarmN(searchParams.get('n'), knobs.topN)` takes the URL
+   value, so the env var only applies to a request that omits `?n=`
+   (a manual `curl`, say). An operator who reaches for the env var in
+   an incident will watch the spend continue unchanged. (`n=0` isn't
+   accepted either — invalid values fall back to the default.)
+3. **Unset `JINA_API_KEY` in Vercel and redeploy.** The article
+   track goes silent **for link posts** (each logs
+   `skipped_unreachable`); self-posts still summarize from the HN
+   `text`, and the comments track continues. Use if Jina-specific
+   billing is the problem.
+4. **Unset `GOOGLE_API_KEY`.** Stops all Gemini spend. Both tracks
+   become effectively read-only — they log their backoff decisions
+   and hash-checks but never regenerate. Nuclear option if Gemini
+   billing is the problem.
+
+All four are reversible — put the env var / `crons` entry back and
+redeploy.
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| No `warm-run` lines in logs | Cron not firing. | Check Pro tier, `vercel.json` has `crons` entry, deployment succeeded, Cron Jobs dashboard lists it. |
+| Cron Jobs dashboard shows invocations but every one is a 403 | `CRON_SECRET` not set in the project env, or set only for a different environment (e.g. Production ticked but the cron is hitting a Preview deployment). Vercel fires with no `Authorization` header and the handler fail-closed returns 403. | Set `CRON_SECRET` in **Settings → Environment Variables**, scope it to the environment the cron fires in, redeploy so the env change takes effect. |
+| Manual `curl` with the secret works but scheduled runs 403 | The `CRON_SECRET` value in the Vercel env doesn't match what you typed locally (env var drift, or the project was redeployed without the var saved). | In the Vercel UI, re-save `CRON_SECRET` with a known value and redeploy. Vercel can't show you the existing value, so "just check what's set" isn't an option — overwrite and re-record. |
+| 503 `{"error":"Store not configured","reason":"no_store"}` | Upstash env vars unset or typo. | Check both `KV_REST_API_URL` / `KV_REST_API_TOKEN` pair (or `UPSTASH_REDIS_REST_URL` / `..._TOKEN` pair) are set for the environment serving the cron. |
+| Every link-post story logs `skipped_unreachable` (self-posts still summarize) | `JINA_API_KEY` missing or invalid. | Re-run the Jina sanity-check from INSTALL.md. Note: `skipped_unreachable` is also the right outcome if Jina is genuinely down — check their status page before assuming a config issue. |
+| Gemini spend climbing faster than expected | Articles or comments churning more than forecast, or a publisher's page has rotating content Jina can't strip (e.g., an always-changing timestamp in the body). | Grep `warm-story` lines for the high-churn `storyId`s — `contentBytes` barely moving across "changed" rows is the timestamp-rotation signature. If it's a single publisher domain, file it to the article-fetch-fallback allowlist TODO. |
+| `warm-run.durationMs` close to 50 s | Hitting the wall-clock budget. Stories queued at the tail log `skipped_budget`. | Transient Jina / HN slowness usually. If persistent, lower `n=30` to `n=20` in `vercel.json`'s cron path (not `WARM_TOP_N` — the URL value wins) or investigate specific slow stories in the per-story logs. |
+| `warm-run` count of `skipped_interval` >> `unchanged` + `changed` | Normal — means the backoff is doing its job; stories in their refresh window don't need work. Not a problem. | None. This is the steady state. |
+
+## Cost sanity check
+
+At defaults with 5-min cadence:
+
+- **Vercel invocations:** 288 per day. Well inside Pro's limits.
+- **HN Firebase:** ≤8,640 top-story fetches/day + comments child-fetches. Free, no rate limits.
+- **Jina Reader:** ~1,500–3,000/day realistic, ~45–90k/month. At a planning figure of ~5,000 tokens per Reader call that's ~7.5–15M tokens/day, so the one-time 10M-token free grant per key (does not refresh daily or monthly) drains in **roughly a day or two** of steady cron traffic, not weeks. After that you top up (~$0.02/M tokens, ~$5–10/month for ongoing use at this volume) or rotate the key. Measured: 12.93M tokens/day in the 24h census, **~$8/month** — the one line of this cost model production confirmed. The handler returns 503 `summary_budget_exhausted` and the cron logs `skipped_payment_required` between top-ups; see `SPEC.md` § "Scheduled warming and change analytics" for the full cost breakdown.
+- **Gemini:** **~$17/month, measured — not the ~$3–5 realistic / ~$15 worst-case this line used to project.** `reports/2026-04-29-cache-strategy.md` censused 24h of cron-only usage on this configuration: 5,440,518 prompt + 31,283 output tokens/day (article 5.04M/16.6K, comments 398K/14.7K), which at $0.10/M input + $0.40/M output is $0.557/day. That report computes at $0.075/$0.30 and flags the rate as unconfirmed — at its pair the same census is ~$12.50/month. Budget on the higher and confirm against Google's current pricing. **Over half the article-track spend is regeneration on content deltas too small to change the summary**; the `WARM_MIN_DELTA_BYTES` fix specified in that report has not shipped, so that waste is live.
+- **Upstash:** Two keys per story, and `processStory` reads *both* for every selected id on every tick, unconditionally — the backoff gate decides off what those reads return, so it cannot skip them. At defaults that is 288 ticks × 30 stories × 2 GETs = **17,280 commands/day (~520k/month)** before record writes, the rate limiter's `INCR`/`EXPIRE`, telemetry `LPUSH`/`LTRIM`, or user-facing summary reads. This line previously read "Well inside the free tier"; that was wrong — it is roughly 1.7× a 10k commands/day free allowance. At Upstash's pay-as-you-go rate (~$0.20 per 100k commands) that is **~$1/month** for the cron baseline alone, rising with reader traffic — so **provision a paid Upstash plan rather than assuming the free tier covers this**, and if you need to stay inside a free allowance, the two knobs that move this number are the story count and the cadence — **both of which live in `vercel.json`, not the environment.** Setting `WARM_TOP_N` does nothing to a scheduled run: the cron path is `/api/warm-summaries?feed=top&n=30` and the handler reads `parseWarmN(searchParams.get('n'), knobs.topN)` (`api/warm-summaries.ts:1928`), so the explicit `n=30` wins and the env var is only the fallback for a URL that omits `?n=`. To actually shrink the tick, edit `n=` in the cron path and redeploy; to widen the cadence, edit the `schedule` next to it.
+
+  **If you hit the quota, the failure is expensive, not cheap.** The record reads are `.catch(() => null)`, and a null record is indistinguishable from a never-seen one, so a quota-exhausted or unreachable Redis loses the age / interval backoff — the only gate that consults the record — and every story that clears the *other* gates takes the `first_seen` path and regenerates, on every tick. **Every eligible story, not every story**: the outcomes decided without the record still fire normally — `skipped_low_score`, `skipped_unreachable` and `skipped_payment_required` on the article track, `skipped_no_content` and `skipped_low_volume` on the comments track — so the signature is an **anomalous `first_seen` spike with `skipped_interval` collapsing to zero**, *not* an all-`first_seen` run, and a run that still shows those outcomes is not evidence against the outage. Spend rises sharply but not uniformly: every eligible article pays Jina and Gemini, while self-posts pay Gemini alone (no Jina round-trip). `WALL_CLOCK_BUDGET_MS` will not save you — it gates *starting* a queued story, so it caps how many a runaway tick begins, not how long the in-flight ones run.
+
+See `SPEC.md` § "Scheduled warming and change analytics" for the full
+cost breakdown and new failure modes.
+
+## See also
+
+- `SPEC.md` § "Scheduled warming and change analytics" — architecture & rationale.
+- `INSTALL.md` — env vars, API key setup.
+- `TODO.md` — follow-ups: analytics surface, article-fetch fallback allowlist, Jina retry, multi-region replication, cron jitter.
+- `AGENTS.md` § "Vercel api/ gotchas" — why the cron handler duplicates helpers instead of sharing.
