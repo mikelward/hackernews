@@ -106,10 +106,26 @@ describe('<Comment> nested layout CSS invariants', () => {
     // margin-right must negate the 12px gutter. happy-dom doesn't
     // evaluate calc(), so we accept both the resolved literal
     // (-12px, what a real browser reports) and the unresolved
-    // expression forms (`calc(12px * -1)`, `calc(-1 * 12px)`, or
-    // `-12px` if the author pre-negated). Any of them satisfies the
-    // invariant.
-    expect(computed.marginRight).toMatch(/^(?:-12px|calc\([^)]*-1[^)]*\))$/);
+    // expression forms (`calc(12px * -1)`, `calc(-1 * 12px)`,
+    // `calc(var(--comment-gutter) * -1)`, or `-12px` if the author
+    // pre-negated). Any of them satisfies the invariant.
+    //
+    // Every serialization happy-dom actually produces for a negated
+    // gutter, enumerated rather than approximated — `-12px`,
+    // `calc(-12px)`, and the operand times -1 in either order, with
+    // the operand either substituted (`12px`) or not
+    // (`var(--comment-gutter)`). 20.11 substitutes the custom property
+    // before returning the computed value and 20.14 stopped, so both
+    // have to pass. What must NOT pass is a different multiplier or
+    // operand — `calc(var(--comment-gutter) * -10)`, `calc(-1px)` —
+    // which is the regression this guard exists to catch, so the
+    // alternation is closed rather than wildcarded.
+    const OPERAND = String.raw`(?:12px|var\(--comment-gutter\))`;
+    expect(computed.marginRight).toMatch(
+      new RegExp(
+        String.raw`^(?:-12px|calc\(\s*(?:-12px|${OPERAND}\s*\*\s*-1|-1\s*\*\s*${OPERAND})\s*\))$`,
+      ),
+    );
     // Left margin must NOT be negative — the left indent is the
     // intentional cue for reply depth and stays inside the parent's
     // padding.
