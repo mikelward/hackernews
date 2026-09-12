@@ -259,9 +259,10 @@ If any of the above fails, fix it — don't disable the check.
   where the `threadId` comes from).
 - Ask first before: force-pushing to `main`/`master` or to a merged
   branch (resetting a merged branch name included — see *Branching*),
-  rewriting history on shared branches, deleting a branch this session
-  neither created nor was assigned, changing Vercel project settings,
-  changing CI secrets, adding paid/third-party services.
+  rewriting history on shared branches, deleting a branch outside your
+  prefix or one under it this session neither created nor was assigned,
+  changing Vercel project settings, changing CI secrets, adding
+  paid/third-party services.
 
 ## Commit messages
 
