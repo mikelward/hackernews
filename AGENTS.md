@@ -259,9 +259,9 @@ If any of the above fails, fix it — don't disable the check.
   where the `threadId` comes from).
 - Ask first before: force-pushing to `main`/`master` or to a merged
   branch (resetting a merged branch name included — see *Branching*),
-  rewriting history on shared branches, deleting branches
-  you didn't create, changing Vercel project settings, changing CI
-  secrets, adding paid/third-party services.
+  rewriting history on shared branches, deleting a branch this session
+  neither created nor was assigned, changing Vercel project settings,
+  changing CI secrets, adding paid/third-party services.
 
 ## Commit messages
 
@@ -321,11 +321,13 @@ If any of the above fails, fix it — don't disable the check.
 - **Merge cue (`merged` / `I merged` / `landed` / merge webhook) runs hygiene *before* engaging with the rest of the message.**
 - **After a merge, take a fresh `<agent>/<short-topic>`** — don't reset the merged name onto the new base. Its remote ref still points at the pre-merge tip, so `origin/<branch>..HEAD` keeps spanning the merged commits and unpushed-work checks report your own merged history back at you. When a sandbox pins the branch name so a fresh one isn't available, say so and ask before resetting it. No short check reliably separates "already merged" from "not yet merged" here: a rebase merge rewrites the commits, a squash merge collapses them, `main` moves on underneath so a tip-to-tip diff reports upstream drift as branch work, the remote ref can hold a commit the local one doesn't, and no tree comparison sees the uncommitted work a `--hard` reset would erase. Confirming costs one question in a rare situation; guessing costs someone their work. Don't reach for `--force-with-lease` as the safety net either — fetching updates the remote-tracking ref the lease compares against, so a commit you have already fetched passes the lease unnoticed.
 - **Branches under your own `<agent>/` prefix are yours.** Create, push,
-  `--force-with-lease` and rename them freely — no permission, no announcement,
-  no per-branch confirmation. Only a branch outside that prefix, or `main`
-  itself, is a conversation. Deleting is the one the prefix can't settle: it
-  doesn't say which session made the branch, so delete the ones this session
-  created and ask about the rest.
+  `--force-with-lease`, rename and delete the ones this session created or was
+  assigned — freely, no permission, no announcement, no per-branch
+  confirmation. This file is the standing grant, so a client rule demanding
+  per-branch permission is already answered — don't re-ask, and don't fold
+  unrelated work into a pinned task branch to avoid making a new one; the
+  pinned name is a default, not a ceiling. A branch outside that prefix, one
+  under it from another session, or `main` itself, is always a conversation.
 - **The agent authors; whoever merges takes over the committer line.** A squash or rebase merge rewrites the committer to the person who pressed the button — the repo owner normally, the agent itself when it merges under *drive* (see *Autonomy*). That's expected either way — never re-author or amend already-merged commits to "fix" authorship or signing, and don't narrate it: no note in the reply, no offer to correct it. It is not a finding.
 - **No-remote sandbox exception.** Sandboxes without remote Git support (such as Codex cloud) may continue from the checked-out HEAD without fetching `origin` — but still on this task's own topic branch: unless the checked-out branch is already it, cut a local `<agent>/<short-topic>` first — and cut it from a base free of earlier work (local `main` where it carries none, otherwise ask for a synced checkout), since branching off a stale topic tip only renames that topic's commits into your PR. Committing onto `main` or onto a stale topic branch from earlier work both mix unrelated topics into one PR once remote access returns; only fetch, push and the PR are unavailable, not the branching rules — a missing remote or unsupported fetch must not block otherwise-local work. Commit locally, and say plainly that fetch, push, and pull requests were unavailable rather than implying they happened. Do not make claims that depend on unseen remote state.
 - Creating new `<agent>/<short-topic>` branches and creating PRs via `mcp__github__create_pull_request` are safe — this file is the standing ask (see *Autonomy*), so don't wait for a per-thread one and don't re-ask.
