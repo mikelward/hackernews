@@ -443,9 +443,9 @@ If any of the above fails, fix it — don't disable the check.
 ## Codex reviews
 
 **Codex is the automated reviewer on this repo** — not Copilot. Its reviews
-are triggered automatically; you don't request them, except when nothing has
-come back five minutes after a push — that means it never picked the push
-up — or to confirm a rebutted false positive.
+are triggered automatically; you don't request them, except to confirm a
+rebutted false positive, or where *Read the Codex verdict* below says the
+`codex` status is still pending.
 
 - **Address Codex comments automatically — don't wait to be asked.** When a Codex review lands, treat each comment like a real review note: read it, decide whether it's a real issue or a false positive, and if it's real, fix it in the same PR — the one exception being a real finding that's genuinely out of scope for this PR, which you defer instead (see *Deferring a finding* below). Fold the fix into the commit it belongs to (rebase / `--fixup`) rather than tacking on an "address review" commit, per the *one commit per logical surviving change* rule in *Branching*. Group several small fixes into one commit when they share a topic.
 - **Reply to (and resolve) every addressed Codex comment.** When you land a commit that addresses a Codex review comment, post a short reply on that comment via `mcp__github__add_reply_to_pull_request_comment` (one or two sentences — what you did, e.g. ``Fixed in `abc1234` — switched to `useSyncExternalStore` as suggested.``) and then resolve the thread with `mcp__github__resolve_review_thread` (see the resolve bullet below for where the `threadId` comes from). Do this for each addressed comment, not in bulk.
@@ -484,10 +484,9 @@ up — or to confirm a rebutted false positive.
 - **Never leave a review comment thread silently dismissed.** Answer on the thread, then resolve it — a reply alone leaves it open, and under *require conversations resolved* that blocks the merge as firmly as ignoring it. A deferral is resolved the same way, once its follow-up is recorded (see *Deferring a finding*). When you think a comment is a false positive, say *why* on the thread (one or two sentences): the reasoning is exactly what the user wants surfaced, and "Vercel-only failure, doesn't apply" is more useful on the PR than buried in chat history. Acknowledgement noise ("good catch, will do") is fine and preferred over silence; the discipline is "say something or resolve", not "say nothing". This applies to human reviewers too, not just Codex.
 - **Deferring a real-but-out-of-scope finding.** Don't ask the maintainer to merge past it: note the follow-up in `TODO.md`, commit and push that first, reply on the thread citing the sha, and resolve. A finding with no thread (top-level comment or review body) still gets the `TODO.md` record, the push, and the reply — only the resolve is skipped. The push re-triggers Codex, so don't also poke it unless five minutes pass with nothing back; escalate if the re-review re-raises it, or stays silent.
 - **Wait for Codex's verdict on the current head, and no open comments,
-  before merging.** Don't merge until Codex's verdict covers the head you
-  are merging — its `+1` on the PR body, or a review naming that commit with
-  no findings — and no review comment is left open. Don't ask whether it's
-  okay to merge — wait for the signal.
+  before merging.** The gate is the rule above, in one place: the required
+  `codex` status green for the head you are merging, and no review comment
+  left open. Don't ask whether it's okay to merge — wait for the signal.
 - When a feature has multiple open PRs, list **every** open PR by URL,
   one per line — the "View PR" chip sticks to the first link and hides
   the rest (anthropics/claude-code#46625).
